@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Grade monitor daemon — runs forever with smart polling, restarts on crash -->
+  <key>Label</key>
+  <string>com.inbar.monitor</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__VENV_PYTHON__</string>
+    <string>__SCRIPT_PATH__</string>
+    <string>--daemon</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__WORK_DIR__</string>
+
+  <!-- Restart automatically if the process exits for any reason -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Wait 30 s before restarting after a crash -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>__WORK_DIR__/logs/monitor.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__WORK_DIR__/logs/monitor_error.log</string>
+
+  <!-- Flush Python stdout/stderr immediately to log files -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <!-- Start at login -->
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>

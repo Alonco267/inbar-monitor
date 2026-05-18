@@ -1,0 +1,52 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm i *)",
+      "Bash(wrangler whoami *)",
+      "Bash(wrangler login *)",
+      "Bash(wrangler kv *)",
+      "Bash(wrangler secret *)",
+      "Bash(wrangler deploy *)",
+      "Bash(curl -s \"https://api.telegram.org/botREDACTED_REVOKED_TOKEN/setWebhook\" -d \"url=https://inbar-relay.alonco267.workers.dev/telegram-webhook\" -d \"secret_token=REDACTED_REVOKED_SECRET\")",
+      "Bash(curl -s \"https://inbar-relay.alonco267.workers.dev/health\")",
+      "Bash(curl -s \"https://api.telegram.org/botREDACTED_REVOKED_TOKEN/getWebhookInfo\")",
+      "Bash(python3 -m json.tool)",
+      "Bash(node -e 'const fs=require\\(\"fs\"\\); const s=fs.readFileSync\\(\"../userscript/inbar-monitor.user.js\",\"utf8\"\\); fs.writeFileSync\\(\"userscript-bundle.js\", \"export const USERSCRIPT = \" + JSON.stringify\\(s\\) + \";\\\\n\"\\);')",
+      "Bash(curl -s \"https://inbar-relay.alonco267.workers.dev/\")",
+      "Bash(curl -s \"https://inbar-relay.alonco267.workers.dev/inbar-monitor.user.js\")",
+      "Bash(npm install *)",
+      "Bash(npx vitest *)",
+      "Bash(npm test *)",
+      "Bash(npx wrangler *)",
+      "Bash(kill 99588)",
+      "Bash(venv/bin/python monitor.py)",
+      "Bash(venv/bin/python -c ' *)",
+      "Bash(venv/bin/python -m pytest tests/ -q)",
+      "Bash(launchctl list *)",
+      "Bash(curl -s --max-time 5 https://api.telegram.org)",
+      "Bash(curl -s --max-time 5 \"https://inbar-relay.alonco267.workers.dev/health\")",
+      "Bash(curl -s --max-time 5 \"https://inbar.biu.ac.il\" -o /dev/null -w \"%{http_code}\")",
+      "Bash(python3 -c \"import secrets; print\\(secrets.token_hex\\(24\\)\\)\")",
+      "Bash(curl -s -X POST https://inbar-relay.alonco267.workers.dev/setup-webhook -H 'Content-Type: application/json' -d '{\"bot_token\":\"REDACTED_REVOKED_TOKEN\"}')",
+      "Bash(launchctl unload *)",
+      "Bash(launchctl load *)",
+      "Bash(python monitor.py)",
+      "Bash(python3 monitor.py)",
+      "Bash(ls .venv/bin/)",
+      "Bash(ls venv/bin/)",
+      "Bash(.venv/bin/python monitor.py)",
+      "Bash(cat ~/Library/LaunchAgents/com.inbar.monitor.plist | grep -A5 \"ProgramArguments\")",
+      "Read(//Users/aloncohen/Library/LaunchAgents/**)",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\('/Users/aloncohen/Inbar monitor/session_cookies.json'\\)\\); print\\(f'{len\\(d\\)} cookies, first: {d[0][\\\\\"name\\\\\"] if d else \\\\\"empty\\\\\"}'\\)\")",
+      "Bash(python3 -c ' *)",
+      "Skill(caveman)",
+      "Skill(caveman:*)",
+      "Bash(cat > *)",
+      "Bash(venv/bin/python /tmp/test_logout.py)",
+      "Bash(venv/bin/python -c \"import monitor\")"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+# Secrets — never commit these
+.env
+session_cookies.json
+data.json
+users.json
+debug_page.html
+
+# Browser profile (contains auth cookies)
+browser_session/
+
+# Logs
+logs/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node (worker)
+node_modules/
+.wrangler/
+
+# Local-only persistent state — Playwright user data dir
+inbar_profile/

@@ -1,0 +1,16 @@
+name = "inbar-relay"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Free tier: 100k requests/day, 10ms CPU per req. Plenty for 1000 users.
+workers_dev = true
+
+# After running:  wrangler kv namespace create TOKENS
+# paste the returned `id` here.
+[[kv_namespaces]]
+binding = "TOKENS"
+id = "4c7fa02893ae464ea9ebde0d208dc319"
+
+# Secrets are NOT put in this file. Use:
+#   wrangler secret put BOT_TOKEN
+#   wrangler secret put WEBHOOK_SECRET
