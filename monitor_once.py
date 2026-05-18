@@ -128,11 +128,13 @@ async def run_once() -> int:
             await page.wait_for_timeout(2_000)
 
             # _is_on_grades_page() matches ANY Inbar URL that isn't a login page,
-            # so use a stricter path check here.
-            GRADES_PATH_MARKER = "StudentAssignmentTermList"
+            # so use a stricter path-only check here. (Login.aspx ?ReturnUrl=...
+            # query strings can contain "StudentAssignmentTermList" even though
+            # we're NOT on the grades page yet.)
+            from urllib.parse import urlparse
 
             def on_grades_url():
-                return GRADES_PATH_MARKER in page.url
+                return "StudentAssignmentTermList" in urlparse(page.url).path
 
             if not on_grades_url():
                 print(f"[ONCE] not on grades page (at: {page.url}) — attempting login")
