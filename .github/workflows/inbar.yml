@@ -2,11 +2,12 @@ name: Inbar grade check
 
 on:
   schedule:
-    # Every 15 minutes, 08:00–22:45 Israel time.
-    # GitHub cron is UTC. Israel is UTC+2 (winter) / UTC+3 (DST).
-    # Using UTC+2 baseline (05:00–20:45 UTC) — during DST the window shifts to
-    # 09:00–23:45 local, which is fine for grade-watching.
-    - cron: "*/15 5-20 * * *"
+    # Every 5 minutes during daytime Israel hours.
+    # GitHub cron is UTC. Israel is UTC+2 (winter) / UTC+3 (DST), so the
+    # window below is roughly 07:00–22:55 local in winter, 08:00–23:55 in DST.
+    # WARNING: a private repo will burn ~9,500 Actions minutes/month at this
+    # rate (free tier = 2,000). Make the repo public for unlimited free Actions.
+    - cron: "*/5 5-20 * * *"
   workflow_dispatch:        # manual "Run workflow" button
 
 concurrency:

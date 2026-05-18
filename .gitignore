@@ -4,6 +4,7 @@ session_cookies.json
 data.json
 users.json
 debug_page.html
+debug_*.html
 
 # Browser profile (contains auth cookies)
 browser_session/
