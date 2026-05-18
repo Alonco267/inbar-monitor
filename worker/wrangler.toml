@@ -14,3 +14,7 @@ id = "4c7fa02893ae464ea9ebde0d208dc319"
 # Secrets are NOT put in this file. Use:
 #   wrangler secret put BOT_TOKEN
 #   wrangler secret put WEBHOOK_SECRET
+
+# Hourly watchdog: DM users whose heartbeat is stale > 60 min.
+[triggers]
+crons = ["0 * * * *"]

@@ -53,7 +53,47 @@ const MONKEY_LINKS = {
   safari:  'https://apps.apple.com/app/userscripts/id1463298887'   // Safari: "Userscripts" (free, OSS)
 };
 
+// Stale-heartbeat watchdog: how old before we warn the user.
+const WATCHDOG_STALE_MS = 60 * 60 * 1000;          // 60 min
+// And don't re-warn for the same user more than once per day.
+const WATCHDOG_REWARN_TTL = 60 * 60 * 24;           // 24 hours (KV TTL, in seconds)
+
 export default {
+  async scheduled(_event, env, _ctx) {
+    // Iterate every linked user (keys without prefixes are tokens) and check
+    // their heartbeat freshness. KV list() returns at most 1000 keys per page
+    // — fine for any realistic single-bot deployment.
+    let cursor;
+    const now = Date.now();
+    do {
+      const page = await env.TOKENS.list({ cursor });
+      for (const { name: key } of page.keys) {
+        // Skip non-token keys (they contain a colon, e.g. `chat:123`, `heartbeat:abc`).
+        if (key.includes(':')) continue;
+        if (!TOKEN_RE.test(key)) continue;
+        const token = key;
+        const chatId = await env.TOKENS.get(token);
+        if (!chatId) continue;
+
+        // Suppress if we already warned recently.
+        if (await env.TOKENS.get(`warned:${token}`)) continue;
+
+        const hbStr = await env.TOKENS.get(`heartbeat:${token}`);
+        if (!hbStr) continue;   // never reported — nothing to warn about yet
+        const hb = parseInt(hbStr, 10);
+        if (now - hb < WATCHDOG_STALE_MS) continue;
+
+        const ageLabel = formatAgo(now - hb);
+        await sendTelegram(env, chatId,
+          `⚠️ הסקריפט הפסיק לרוץ.\nעדכון אחרון: ${ageLabel}.\n` +
+          `בדוק/י ב-GitHub Actions שהריצות מצליחות, או שאת/ה לא חסום/ה ע"י אינ-בר.`);
+        await env.TOKENS.put(`warned:${token}`, String(now),
+          { expirationTtl: WATCHDOG_REWARN_TTL });
+      }
+      cursor = page.list_complete ? null : page.cursor;
+    } while (cursor);
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
 
@@ -208,12 +248,16 @@ async function handleConnectedButton(env, chatId) {
   const ageMs = Date.now() - hb;
   const ageLabel = formatAgo(ageMs);
   let status;
-  if (ageMs < 10 * 60 * 1000) {
+  // GitHub Actions cron runs every 5 min but can be delayed up to ~30 min
+  // under platform load — so be generous with the "active" threshold.
+  if (ageMs < 20 * 60 * 1000) {
     status = `✅ מחובר ופעיל. עדכון אחרון: ${ageLabel}.`;
+  } else if (ageMs < 60 * 60 * 1000) {
+    status = `⏳ הריצה האחרונה הייתה ${ageLabel}.\nGitHub Actions לפעמים מתעכב מעט — נסה/י שוב בעוד דקות.`;
   } else if (ageMs < 24 * 60 * 60 * 1000) {
-    status = `⚠️ הסקריפט לא רץ ברגע זה. אחרון: ${ageLabel}.\nפתח/י לשונית של אינ-בר כדי לעדכן.`;
+    status = `⚠️ הסקריפט לא רץ כבר ${ageLabel}.\nבדוק/י ב-GitHub Actions שהריצות עוברות בהצלחה.`;
   } else {
-    status = `🔴 לא ראינו את הסקריפט כבר ${ageLabel}.\nודא/י שהסקריפט מותקן ושאת/ה מחובר/ת לאינ-בר.`;
+    status = `🔴 לא ראינו את הסקריפט כבר ${ageLabel}.\nודא/י שה-GitHub workflow פעיל ושהסודות תקפים.`;
   }
   await sendTelegram(env, chatId, status);
 }
@@ -254,6 +298,9 @@ async function handleHeartbeat(request, env) {
   if (!(await env.TOKENS.get(token))) return json({ error: 'not linked' }, 404);
   await env.TOKENS.put(`heartbeat:${token}`, String(Date.now()),
     { expirationTtl: HEARTBEAT_TTL });
+  // The script is alive again — clear any pending "you've gone silent" warning
+  // so a future outage can trigger a fresh alert.
+  await env.TOKENS.delete(`warned:${token}`);
   return json({ ok: true });
 }
 
