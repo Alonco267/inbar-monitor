@@ -26,10 +26,26 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+      # Cache Playwright's Chromium binary across runs (~100MB).
+      # Cache key tied to requirements.txt so a Playwright version bump
+      # invalidates it automatically.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Python deps (always runs, fast — pip cache hits)
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser (download only on cache miss)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Install Playwright OS deps (system libs only, browser cached)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
 
       - name: Run one-shot grade check
         env:
