@@ -645,7 +645,9 @@ async def _otp_login_via_telegram(page, relay_url: str, token: str) -> bool:
     then get the OTP code from the user via Telegram and complete login.
     Requires INBAR_ID and INBAR_PHONE in .env — without them returns False immediately.
     """
-    inbar_id    = os.environ.get('INBAR_ID', '')
+    # The Inbar form labels its first field 'edtUsername', but at BIU students
+    # log in with their 9-digit ID. Prefer INBAR_ID; fall back to INBAR_USERNAME.
+    inbar_id    = os.environ.get('INBAR_ID', '') or os.environ.get('INBAR_USERNAME', '')
     inbar_phone = os.environ.get('INBAR_PHONE', '')
 
     if not inbar_id or not inbar_phone:
@@ -655,42 +657,46 @@ async def _otp_login_via_telegram(page, relay_url: str, token: str) -> bool:
     try:
         print(f"[OTP-LOGIN] Login page: {page.url}")
 
-        # Fill the pre-OTP form automatically
-        if inbar_id:
-            for sel in ['#id', 'input[name="id"]', 'input[name="teudat_zehut"]',
-                        'input[placeholder*="ת.ז"]', 'input[placeholder*="מספר זהות"]']:
-                el = await page.query_selector(sel)
-                if el and await el.is_visible():
-                    await el.fill(inbar_id)
-                    print(f"[OTP-LOGIN] Filled ID into {sel}")
-                    break
+        # Step 1 form: Inbar's own Login.aspx (selectors confirmed from page dump
+        # 2026-05-18 — edtUsername + edtMobile + btnLogin).
+        for sel in ['#edtUsername', 'input[name="edtUsername"]',
+                    '#id', 'input[name="id"]', 'input[name="teudat_zehut"]',
+                    'input[placeholder*="ת.ז"]', 'input[placeholder*="מספר זהות"]']:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                await el.fill(inbar_id)
+                print(f"[OTP-LOGIN] Filled ID into {sel}")
+                break
 
-        if inbar_phone:
-            for sel in ['#phone', 'input[name="phone"]', 'input[name="cellphone"]',
-                        'input[placeholder*="טלפון"]', 'input[placeholder*="נייד"]',
-                        'input[type="tel"]']:
-                el = await page.query_selector(sel)
-                if el and await el.is_visible():
-                    await el.fill(inbar_phone)
-                    print(f"[OTP-LOGIN] Filled phone into {sel}")
-                    break
+        for sel in ['#edtMobile', 'input[name="edtMobile"]',
+                    '#phone', 'input[name="phone"]', 'input[name="cellphone"]',
+                    'input[placeholder*="טלפון"]', 'input[placeholder*="נייד"]',
+                    'input[type="tel"]']:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                await el.fill(inbar_phone)
+                print(f"[OTP-LOGIN] Filled phone into {sel}")
+                break
 
-        if inbar_id or inbar_phone:
-            for sel in ['button[type="submit"]', 'input[type="submit"]', '#btnSend',
-                        '#btnLogin', '#submitButton']:
-                el = await page.query_selector(sel)
-                if el and await el.is_visible():
-                    await el.click()
-                    break
-            await page.wait_for_load_state('networkidle', timeout=15_000)
-            await page.wait_for_timeout(1_500)
+        for sel in ['#btnLogin', 'input[name="btnLogin"]',
+                    'button[type="submit"]', 'input[type="submit"]',
+                    '#btnSend', '#submitButton']:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                print(f"[OTP-LOGIN] Clicking submit: {sel}")
+                await el.click()
+                break
+        await page.wait_for_load_state('networkidle', timeout=20_000)
+        await page.wait_for_timeout(2_000)
 
-        # At this point we expect to be on the OTP input page (step 2).
-        # Exclude input[type="tel"] — that's the phone field on step 1, not the code field.
+        # Step 2 page: OTP input. Selectors are guesses — if none match we dump
+        # the page so we can see the real names.
         otp_selectors = [
-            '#idTxtBx_SAOTCC_OTC',          # Microsoft ADFS standard
+            '#edtOTP', '#edtCode', '#edtSmsCode', '#edtPin',
+            'input[name="edtOTP"]', 'input[name="edtCode"]', 'input[name="edtSmsCode"]',
+            '#idTxtBx_SAOTCC_OTC',          # Microsoft ADFS fallback
             'input[name*="otp"]', 'input[name*="code"]', 'input[name*="OTC"]',
-            'input[placeholder*="קוד"]',     # Hebrew "code"
+            'input[placeholder*="קוד"]',
             'input[maxlength="6"]', 'input[maxlength="8"]',
         ]
         otp_field = None
@@ -702,7 +708,22 @@ async def _otp_login_via_telegram(page, relay_url: str, token: str) -> bool:
                 break
 
         if not otp_field:
-            print("[OTP-LOGIN] No OTP input found — cannot complete login")
+            print(f"[OTP-LOGIN] No OTP input found — dumping page so we can fix selectors")
+            print(f"[OTP-LOGIN] Now at: {page.url}")
+            try:
+                from pathlib import Path
+                Path("debug_otp_page.html").write_text(await page.content(), encoding="utf-8")
+                inputs = await page.eval_on_selector_all(
+                    "input",
+                    "els => els.map(e => ({type:e.type, name:e.name, id:e.id, "
+                    "maxlength:e.maxLength, placeholder:e.placeholder, "
+                    "visible:e.offsetParent!==null}))"
+                )
+                print(f"[OTP-LOGIN] inputs on step-2 page:")
+                for inp in inputs:
+                    print(f"  {inp}")
+            except Exception as e:
+                print(f"[OTP-LOGIN] could not dump page: {e}")
             return False
 
         # Request code from user via Telegram
@@ -756,15 +777,61 @@ async def _otp_login_via_telegram(page, relay_url: str, token: str) -> bool:
         return False
 
 
+async def _portal_login(page, username: str, password: str) -> bool:
+    """
+    Click the 'פורטל בר-אילן שלי' link on Inbar's Login.aspx → routes through
+    BIU's central SSO. The portal session is much longer-lived than Inbar's,
+    so this skips the SMS step most of the time. If the portal session is
+    also expired, the redirect lands on ADFS where _auto_login fills creds.
+    """
+    try:
+        print(f"[PORTAL-LOGIN] Looking for portal link on: {page.url}")
+        link = await page.query_selector('a:has-text("פורטל")')
+        if not link or not await link.is_visible():
+            print("[PORTAL-LOGIN] Portal link not visible on this page")
+            return False
+
+        await link.click()
+        await page.wait_for_load_state('networkidle', timeout=20_000)
+        await page.wait_for_timeout(1_500)
+        print(f"[PORTAL-LOGIN] After click, at: {page.url}")
+
+        # Fast path: SSO cookies still valid → straight to grades.
+        if _is_on_grades_page(page.url):
+            print("[PORTAL-LOGIN] ✓ SSO cookies valid — already on grades page")
+            return True
+
+        # Portal asks for credentials → use the ADFS auto-login.
+        if username and password:
+            print("[PORTAL-LOGIN] Portal asking for credentials — running ADFS auto-login")
+            if await _auto_login(page, username, password):
+                # ADFS may not redirect us all the way to grades — nudge it.
+                if not _is_on_grades_page(page.url):
+                    await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30_000)
+                    await page.wait_for_timeout(2_000)
+                return _is_on_grades_page(page.url)
+        print("[PORTAL-LOGIN] No credentials available — cannot continue")
+        return False
+    except Exception as e:
+        print(f"[PORTAL-LOGIN] Error: {e}")
+        return False
+
+
 async def _handle_login(page, username: str, password: str,
                         relay_url: str, token: str) -> bool:
     """Try every available login method in order. Returns True if now on grades page."""
+    # First choice: BIU portal SSO. No SMS needed if portal cookies are fresh.
+    print("[DAEMON] Trying portal SSO route...")
+    if await _portal_login(page, username, password):
+        return True
+    # Second choice: plain ADFS auto-login (in case we're already at the ADFS page)
     if username and password:
-        print("[DAEMON] Session expired — auto re-login...")
+        print("[DAEMON] Trying direct ADFS auto-login...")
         if await _auto_login(page, username, password):
             return True
+    # Last resort: SMS OTP via Telegram (annoying — user has to respond).
     if relay_url and token:
-        print("[DAEMON] Trying OTP via Telegram...")
+        print("[DAEMON] Trying SMS OTP via Telegram...")
         if await _otp_login_via_telegram(page, relay_url, token):
             return True
     return False

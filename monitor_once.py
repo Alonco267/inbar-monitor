@@ -127,14 +127,38 @@ async def run_once() -> int:
             await page.goto(m.TARGET_URL, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(2_000)
 
-            if not m._is_on_grades_page(page.url):
+            # _is_on_grades_page() matches ANY Inbar URL that isn't a login page,
+            # so use a stricter path check here.
+            GRADES_PATH_MARKER = "StudentAssignmentTermList"
+
+            def on_grades_url():
+                return GRADES_PATH_MARKER in page.url
+
+            if not on_grades_url():
                 print(f"[ONCE] not on grades page (at: {page.url}) — attempting login")
                 ok = await m._handle_login(page, username, password, relay_url, token)
                 if not ok:
+                    # Dump the page so we can fix login selectors.
+                    try:
+                        from pathlib import Path
+                        html = await page.content()
+                        Path("debug_login_page.html").write_text(html, encoding="utf-8")
+                        print(f"[ONCE] dumped page HTML to debug_login_page.html ({len(html)} chars)",
+                              file=sys.stderr)
+                        inputs = await page.eval_on_selector_all(
+                            "input",
+                            "els => els.map(e => ({tag:e.tagName, type:e.type, name:e.name, id:e.id, placeholder:e.placeholder, visible:e.offsetParent!==null}))"
+                        )
+                        print(f"[ONCE] inputs on page:", file=sys.stderr)
+                        for inp in inputs:
+                            print(f"  {inp}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[ONCE] could not dump page: {e}", file=sys.stderr)
                     print("[ONCE] login failed — giving up this run", file=sys.stderr)
                     return 1
                 # _handle_login may not have navigated to the grades page yet
-                if not m._is_on_grades_page(page.url):
+                if not on_grades_url():
+                    print(f"[ONCE] navigating from {page.url} to grades page")
                     await page.goto(m.TARGET_URL, wait_until="domcontentloaded", timeout=30_000)
                     await page.wait_for_timeout(2_000)
 
