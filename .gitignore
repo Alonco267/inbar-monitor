@@ -6,6 +6,9 @@ users.json
 debug_page.html
 debug_*.html
 
+# Claude Code per-project settings (can record secrets in command allowlist)
+.claude/
+
 # Browser profile (contains auth cookies)
 browser_session/
 
