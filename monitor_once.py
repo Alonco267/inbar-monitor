@@ -99,15 +99,16 @@ def _push_grades_summary(relay_url: str, token: str, grades: dict) -> None:
         print(f"[ONCE] summary push failed: {e}", file=sys.stderr)
 
 
-async def run_once() -> int:
-    relay_url = _env("RELAY_URL")
-    token     = _env("DAEMON_TOKEN").lower()
-    username  = _env("INBAR_USERNAME")
-    password  = _env("INBAR_PASSWORD")
-
-    state = _load_state(relay_url, token) or {}
-    storage_state = state.get("storage_state")   # Playwright `storage_state` dict
-    old_grades    = state.get("grades", {})
+async def _scrape_attempt(
+    relay_url: str, token: str, username: str, password: str,
+    storage_state, old_grades: dict, ever_seen: dict,
+) -> int:
+    """
+    Single browser scrape + alert attempt.
+    Raises on unrecoverable errors so the caller can retry.
+    Returns 0 on success, 1 on non-retryable failure (e.g. login totally failed).
+    """
+    from urllib.parse import urlparse
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -127,12 +128,6 @@ async def run_once() -> int:
             await page.goto(m.TARGET_URL, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(2_000)
 
-            # _is_on_grades_page() matches ANY Inbar URL that isn't a login page,
-            # so use a stricter path-only check here. (Login.aspx ?ReturnUrl=...
-            # query strings can contain "StudentAssignmentTermList" even though
-            # we're NOT on the grades page yet.)
-            from urllib.parse import urlparse
-
             def on_grades_url():
                 return "StudentAssignmentTermList" in urlparse(page.url).path
 
@@ -140,25 +135,21 @@ async def run_once() -> int:
                 print(f"[ONCE] not on grades page (at: {page.url}) — attempting login")
                 ok = await m._handle_login(page, username, password, relay_url, token)
                 if not ok:
-                    # Dump the page so we can fix login selectors.
                     try:
-                        from pathlib import Path
                         html = await page.content()
                         Path("debug_login_page.html").write_text(html, encoding="utf-8")
-                        print(f"[ONCE] dumped page HTML to debug_login_page.html ({len(html)} chars)",
-                              file=sys.stderr)
+                        print(f"[ONCE] dumped page HTML ({len(html)} chars)", file=sys.stderr)
                         inputs = await page.eval_on_selector_all(
                             "input",
-                            "els => els.map(e => ({tag:e.tagName, type:e.type, name:e.name, id:e.id, placeholder:e.placeholder, visible:e.offsetParent!==null}))"
+                            "els => els.map(e => ({tag:e.tagName, type:e.type, name:e.name, "
+                            "id:e.id, placeholder:e.placeholder, visible:e.offsetParent!==null}))"
                         )
-                        print(f"[ONCE] inputs on page:", file=sys.stderr)
                         for inp in inputs:
                             print(f"  {inp}", file=sys.stderr)
-                    except Exception as e:
-                        print(f"[ONCE] could not dump page: {e}", file=sys.stderr)
-                    print("[ONCE] login failed — giving up this run", file=sys.stderr)
-                    return 1
-                # _handle_login may not have navigated to the grades page yet
+                    except Exception as dump_err:
+                        print(f"[ONCE] could not dump page: {dump_err}", file=sys.stderr)
+                    print("[ONCE] login failed — non-retryable", file=sys.stderr)
+                    return 1   # login failure: don't retry (would just fail again)
                 if not on_grades_url():
                     print(f"[ONCE] navigating from {page.url} to grades page")
                     await page.goto(m.TARGET_URL, wait_until="domcontentloaded", timeout=30_000)
@@ -167,33 +158,47 @@ async def run_once() -> int:
             print("[ONCE] extracting grades...")
             grades = await m.extract_grades(page)
             if not grades:
-                print("[ONCE] no grades extracted (page may have changed)", file=sys.stderr)
-                return 1
+                raise RuntimeError("no grades extracted — page may have changed")
 
             print(f"[ONCE] {len(grades)} row(s) parsed")
 
-            # Diff & send alerts via the relay. Skip alerting on the very first
-            # run — otherwise every old grade fires an alert.
-            if old_grades:
+            # Build merged_old: old_grades enriched with ever_seen so that grades
+            # we've already alerted on look "old" to diff_and_alert — even if
+            # the KV state was lost between runs.
+            merged_old: dict = dict(old_grades)
+            for key, seen in ever_seen.items():
+                entry = dict(merged_old.get(key, {}))
+                if not m._is_empty(seen.get("grade", "")):
+                    entry["grade"] = seen["grade"]
+                if not m._is_empty(seen.get("final_grade", "")):
+                    entry["final_grade"] = seen["final_grade"]
+                merged_old[key] = entry
+
+            if old_grades or ever_seen:
                 m.diff_and_alert(
-                    old_grades,
+                    merged_old,
                     grades,
                     sender=lambda text: _send_alert(relay_url, token, text),
                 )
             else:
                 print("[ONCE] first run — saving baseline without alerting")
 
-            # Refresh the bot's '📊 רשימת הציונים' button content.
-            _push_grades_summary(relay_url, token, grades)
+            # Expand ever_seen with any graded entries from this scrape.
+            new_ever_seen: dict = dict(ever_seen)
+            for key, info in grades.items():
+                grade = info.get("grade", "—")
+                fg    = info.get("final_grade", "—")
+                if not m._is_empty(grade) or not m._is_empty(fg):
+                    new_ever_seen[key] = {"grade": grade, "final_grade": fg}
 
-            # Heartbeat so the bot's 'connected?' button reflects this run.
+            _push_grades_summary(relay_url, token, grades)
             requests.post(f"{relay_url}/heartbeat", json={"token": token}, timeout=15)
 
-            # Save cookies + grades back to KV for the next run.
             new_storage_state = await ctx.storage_state()
             ok = _save_state(relay_url, token, {
                 "storage_state": new_storage_state,
                 "grades": grades,
+                "ever_seen": new_ever_seen,
             })
             if not ok:
                 print("[ONCE] WARN: state save failed — next run will re-login",
@@ -202,6 +207,37 @@ async def run_once() -> int:
         finally:
             await ctx.close()
             await browser.close()
+
+
+async def run_once() -> int:
+    relay_url = _env("RELAY_URL")
+    token     = _env("DAEMON_TOKEN").lower()
+    username  = _env("INBAR_USERNAME")
+    password  = _env("INBAR_PASSWORD")
+
+    state         = _load_state(relay_url, token) or {}
+    storage_state = state.get("storage_state")
+    old_grades    = state.get("grades", {})
+    ever_seen     = state.get("ever_seen", {})   # grows monotonically, never cleared
+
+    for attempt in range(1, 4):
+        if attempt > 1:
+            wait = 20 * attempt
+            print(f"[ONCE] retry {attempt}/3 — waiting {wait}s...")
+            await asyncio.sleep(wait)
+        try:
+            result = await _scrape_attempt(
+                relay_url, token, username, password,
+                storage_state, old_grades, ever_seen,
+            )
+            if result == 1:
+                return 1   # non-retryable (login failure)
+            return 0
+        except Exception as e:
+            print(f"[ONCE] attempt {attempt}/3 failed: {e}", file=sys.stderr)
+
+    print("[ONCE] all 3 attempts failed — giving up", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Inbar Grade Monitor (Bar-Ilan)
 // @namespace    https://github.com/aloncohen/inbar-monitor
-// @version      1.7.3
+// @version      1.8.0
 // @description  התראה ב-Telegram כשעולים ציונים באינ-בר. הציונים והסיסמה שלך נשארים בדפדפן בלבד.
 // @author       Alon Cohen
 // @match        https://inbar.biu.ac.il/*
@@ -41,7 +41,7 @@
     return;
   }
 
-  log('script loaded v1.7.3 on', location.href);
+  log('script loaded v1.8.0 on', location.href);
 
   // ─── Configuration (set during build/deploy) ──────────────────────────
   const RELAY_URL = 'https://inbar-relay.alonco267.workers.dev';
@@ -412,11 +412,10 @@
       alert('הניתוק נכשל. נסה/י שוב.');
       return false;
     }
-    // Clear local state so banner returns next reload
+    // Clear only link state — grades and ever_alerted are kept intentionally
+    // so reconnecting never re-fires alerts for already-seen grades.
     GM_setValue('token', '');
     GM_setValue('link_confirmation_sent', false);
-    GM_setValue('first_scrape_done', false);
-    GM_setValue('grades', {});
     GM_setValue('last_relogin_alert', 0);
     alert('בוצע. הסקריפט ינסה לחבר מחדש בריענון הבא.');
     location.reload();
@@ -468,9 +467,13 @@
 
   // ─── Main flow ────────────────────────────────────────────────────────
   async function checkAndAlert(token) {
+    // Wait up to 30 s for the grades table to appear (60 × 500 ms).
     let tries = 0;
     while (!document.querySelector(TABLE_SEL)) {
-      if (++tries > 40) return;
+      if (++tries > 60) {
+        log('table not found after 30 s — will retry on next reload');
+        return;
+      }
       await new Promise(r => setTimeout(r, 500));
     }
     await new Promise(r => setTimeout(r, 1500));
@@ -480,16 +483,47 @@
 
     await pushHeartbeatAndSummary(token, fresh);
 
+    // ever_alerted: persistent set of grades already sent as alerts.
+    // Survives token resets and reconnects — prevents duplicate alerts.
+    const everAlerted = GM_getValue('ever_alerted', {});
+
     if (!GM_getValue('first_scrape_done', false)) {
+      // First run after install / reset: treat all current grades as baseline.
+      const newEver = { ...everAlerted };
+      for (const [key, info] of Object.entries(fresh)) {
+        if (!isEmpty(info.grade) || !isEmpty(info.final_grade)) {
+          newEver[key] = { grade: info.grade, final_grade: info.final_grade };
+        }
+      }
+      GM_setValue('ever_alerted', newEver);
       GM_setValue('grades', fresh);
       GM_setValue('first_scrape_done', true);
       GM_setValue('last_check', Date.now());
       return;
     }
 
+    // Merge ever_alerted into the stored snapshot so diff() sees already-alerted
+    // grades as "old" — prevents re-alerting if grades or first_scrape_done were reset.
     const stored = GM_getValue('grades', {});
-    const alerts = diff(stored, fresh);
+    const mergedStored = { ...stored };
+    for (const [key, seen] of Object.entries(everAlerted)) {
+      const entry = { ...(mergedStored[key] || {}) };
+      if (!isEmpty(seen.grade))       entry.grade       = seen.grade;
+      if (!isEmpty(seen.final_grade)) entry.final_grade = seen.final_grade;
+      mergedStored[key] = entry;
+    }
+
+    const alerts = diff(mergedStored, fresh);
     for (const text of alerts) await relayPost('/alert', { token, text });
+
+    // Expand ever_alerted with any newly graded entries.
+    const newEver = { ...everAlerted };
+    for (const [key, info] of Object.entries(fresh)) {
+      if (!isEmpty(info.grade) || !isEmpty(info.final_grade)) {
+        newEver[key] = { grade: info.grade, final_grade: info.final_grade };
+      }
+    }
+    GM_setValue('ever_alerted', newEver);
     GM_setValue('grades', fresh);
     GM_setValue('last_check', Date.now());
   }
@@ -583,7 +617,12 @@
           setTimeout(hideBanner, 6000);
           showChip({ connected: true, onClick: () => unlinkBot(token) });
           await ensureLinkConfirmation(token);
-          checkAndAlert(token);
+          try { await checkAndAlert(token); } catch (e) { log('checkAndAlert error:', e); }
+          // Start ongoing polling now that we're linked.
+          const grades = GM_getValue('grades', {});
+          const ms = Math.min(KEEPALIVE_MS, computePollIntervalMs(grades));
+          log('post-link: next reload in', Math.round(ms / 60000), 'min');
+          setTimeout(() => location.reload(), ms);
         }
       }, 5000);
       return;
@@ -602,7 +641,12 @@
       return;
     }
 
-    await checkAndAlert(token);
+    try {
+      await checkAndAlert(token);
+    } catch (e) {
+      log('checkAndAlert error:', e);
+    }
+    // Always schedule reload — even if checkAndAlert threw, we must keep polling.
     const grades = GM_getValue('grades', {});
     const ms = Math.min(KEEPALIVE_MS, computePollIntervalMs(grades));
     const pending = Object.keys(getPendingCourses(grades)).length;
