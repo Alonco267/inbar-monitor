@@ -25,10 +25,133 @@ class LoginFailed(Exception):
     """All available login methods failed — session cannot be established."""
 
 
-async def auto_login(page, username: str, password: str) -> bool:
-    """Fill the ADFS/Shibboleth login form headlessly and wait for the redirect."""
+GRADES_URL_MARKER = "StudentAssignmentTermList"
+
+
+async def ensure_grades_page(page) -> bool:
+    """After a successful sign-in we may land on Main.aspx or the portal —
+    always finish on the grades list page so callers can scrape immediately."""
+    if GRADES_URL_MARKER in page.url and is_on_grades_page(page.url):
+        return True
+    log.info("logged in but at %s — navigating to grades page", page.url)
     try:
-        log.info("ADFS login page: %s", page.url)
+        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30_000)
+        await page.wait_for_timeout(1_500)
+    except Exception as e:
+        log.warning("navigation to grades page failed: %s", e)
+        return False
+    ok = is_on_grades_page(page.url)
+    log.info("grades page %s — now at: %s", "reached" if ok else "NOT reached", page.url)
+    return ok
+
+
+async def _click_first(page, selectors: list[str]) -> bool:
+    for sel in selectors:
+        el = await page.query_selector(sel)
+        if el and await el.is_visible():
+            await el.click()
+            return True
+    return False
+
+
+async def _microsoft_login(page, username: str, password: str,
+                           otp_provider=None) -> bool:
+    """Microsoft Entra converged sign-in: email → password → MFA (SMS)."""
+    try:
+        email = await page.query_selector('input[name="loginfmt"]')
+        if email and await email.is_visible():
+            log.info("MS sign-in: filling account name")
+            await email.fill(username)
+            await _click_first(page, ['#idSIButton9', 'input[type="submit"]'])
+            await page.wait_for_load_state('networkidle', timeout=20_000)
+            await page.wait_for_timeout(1_000)
+
+        pw_field = None
+        try:
+            pw_field = await page.wait_for_selector(
+                'input[name="passwd"], input[type="password"]', timeout=12_000)
+        except Exception:
+            pass
+        if pw_field and await pw_field.is_visible():
+            log.info("MS sign-in: filling password")
+            await pw_field.fill(password)
+            await _click_first(page, ['#idSIButton9', 'input[type="submit"]',
+                                      'button[type="submit"]'])
+            await page.wait_for_load_state('networkidle', timeout=20_000)
+            await page.wait_for_timeout(1_500)
+
+        err = await page.query_selector('#passwordError, #usernameError')
+        if err and await err.is_visible():
+            log.warning("MS sign-in rejected credentials: %s",
+                        (await err.inner_text()).strip())
+            return False
+
+        await _handle_ms_mfa(page, otp_provider)
+        await _accept_kmsi(page)
+
+        success = is_on_grades_page(page.url)
+        log.info("MS sign-in %s — at: %s", "succeeded" if success else "failed", page.url)
+        return success
+    except Exception as e:
+        log.warning("MS sign-in error at %s: %s", page.url, e)
+        return False
+
+
+async def _handle_ms_mfa(page, otp_provider) -> None:
+    """Handle the 'Verify your identity' proof picker + SMS code entry."""
+    proofs = await page.query_selector('#idDiv_SAOTCS_Proofs')
+    if proofs:
+        log.info("MFA: proof-selection page — choosing SMS")
+        clicked = await _click_first(page, [
+            'div[data-value="OneWaySMS"]',
+            '#idDiv_SAOTCS_Proofs div[role="button"]',
+            '#idDiv_SAOTCS_Proofs .table',
+        ])
+        if not clicked:
+            log.warning("MFA: no clickable proof option found at %s", page.url)
+        await page.wait_for_load_state('networkidle', timeout=20_000)
+        await page.wait_for_timeout(1_500)
+
+    otp_field = await page.query_selector('#idTxtBx_SAOTCC_OTC')
+    if not (otp_field and await otp_field.is_visible()):
+        return
+
+    if otp_provider is None:
+        log.warning("MFA: SMS code required but no OTP provider configured — "
+                    "set TELEGRAM_BOT_TOKEN (bot asks in chat) or DAEMON_TOKEN (relay)")
+        return
+
+    log.info("MFA: SMS sent — waiting for code from OTP provider (up to 5 min)")
+    code = await otp_provider()
+    if not code:
+        log.warning("MFA: no code received — cannot finish sign-in")
+        return
+    log.info("MFA: code received — submitting")
+    await otp_field.fill(code)
+    try:
+        chk = await page.query_selector('#idChkBx_SAOTCC_TD')   # "don't ask again"
+        if chk and await chk.is_visible():
+            await chk.check()
+    except Exception:
+        pass
+    await _click_first(page, ['#idSubmit_SAOTCC_Continue', 'input[type="submit"]',
+                              'button[type="submit"]'])
+    await page.wait_for_load_state('networkidle', timeout=20_000)
+    await page.wait_for_timeout(1_500)
+
+
+async def auto_login(page, username: str, password: str, otp_provider=None) -> bool:
+    """Fill the SSO login form headlessly and wait for the redirect.
+
+    Handles both the Microsoft Entra converged UI (login.microsoftonline.com)
+    and the legacy ADFS/Shibboleth form.
+    """
+    try:
+        log.info("credential login — page: %s", page.url)
+        if ("login.microsoftonline.com" in page.url
+                or await page.query_selector('input[name="loginfmt"]')):
+            return await _microsoft_login(page, username, password, otp_provider)
+
         await page.wait_for_selector('input[type="password"]', timeout=12_000)
 
         for sel in ['#userNameInput', 'input[name="UserName"]', 'input[name="username"]',
@@ -74,8 +197,8 @@ async def _accept_kmsi(page) -> None:
         pass
 
 
-async def otp_login_via_telegram(page, relay: RelayClient) -> bool:
-    """Fill Inbar ID+phone (from env), trigger SMS, get the code via Telegram."""
+async def otp_login_via_telegram(page, otp_provider) -> bool:
+    """Fill Inbar ID+phone (from env), trigger SMS, get the code via provider."""
     inbar_id = os.environ.get('INBAR_ID', '') or os.environ.get('INBAR_USERNAME', '')
     inbar_phone = os.environ.get('INBAR_PHONE', '')
 
@@ -139,16 +262,8 @@ async def otp_login_via_telegram(page, relay: RelayClient) -> bool:
                 log.warning("could not dump OTP page: %s", e)
             return False
 
-        relay.request_otp()
-        log.info("waiting for OTP from Telegram (up to 5 min)...")
-
-        otp_code = None
-        for _ in range(75):
-            await asyncio.sleep(4)
-            otp_code = relay.poll_otp()
-            if otp_code:
-                break
-
+        log.info("waiting for OTP code (up to 5 min)...")
+        otp_code = await otp_provider()
         if not otp_code:
             log.warning("timeout waiting for OTP")
             return False
@@ -173,7 +288,8 @@ async def otp_login_via_telegram(page, relay: RelayClient) -> bool:
         return False
 
 
-async def portal_login(page, username: str, password: str) -> bool:
+async def portal_login(page, username: str, password: str,
+                       otp_provider=None) -> bool:
     """Route through the 'פורטל בר-אילן שלי' link → BIU central SSO.
 
     The portal session is much longer-lived than Inbar's, so this skips the
@@ -192,16 +308,12 @@ async def portal_login(page, username: str, password: str) -> bool:
         log.info("after portal click, at: %s", page.url)
 
         if is_on_grades_page(page.url):
-            log.info("SSO cookies valid — already on grades page")
-            return True
+            log.info("SSO cookies valid — signed in without credentials")
+            return await ensure_grades_page(page)
 
         if username and password:
-            if await auto_login(page, username, password):
-                if not is_on_grades_page(page.url):
-                    await page.goto(TARGET_URL, wait_until="domcontentloaded",
-                                    timeout=30_000)
-                    await page.wait_for_timeout(2_000)
-                return is_on_grades_page(page.url)
+            if await auto_login(page, username, password, otp_provider):
+                return await ensure_grades_page(page)
         log.info("no credentials available — portal route cannot continue")
         return False
     except Exception as e:
@@ -209,18 +321,40 @@ async def portal_login(page, username: str, password: str) -> bool:
         return False
 
 
+def _relay_otp_provider(relay: RelayClient):
+    """Adapt the Cloudflare-relay OTP flow to the async otp_provider protocol."""
+    async def _provider() -> str | None:
+        relay.request_otp()
+        for _ in range(75):
+            await asyncio.sleep(4)
+            code = relay.poll_otp()
+            if code:
+                return code
+        return None
+    return _provider
+
+
 async def handle_login(page, username: str, password: str,
-                       relay: RelayClient | None) -> bool:
-    """Try every available login method in order. True if now on grades page."""
-    log.info("trying portal SSO route...")
-    if await portal_login(page, username, password):
+                       relay: RelayClient | None,
+                       otp_provider=None) -> bool:
+    """Try every available login method in order. True if now on grades page.
+
+    ``otp_provider`` is an async callable returning the SMS code (or None on
+    timeout). When omitted and a relay is given, the relay OTP flow is used.
+    """
+    if otp_provider is None and relay is not None:
+        otp_provider = _relay_otp_provider(relay)
+
+    log.info("login: trying portal SSO route...")
+    if await portal_login(page, username, password, otp_provider):
         return True
     if username and password:
-        log.info("trying direct ADFS auto-login...")
-        if await auto_login(page, username, password):
-            return True
-    if relay is not None:
-        log.info("trying SMS OTP via Telegram...")
-        if await otp_login_via_telegram(page, relay):
-            return True
+        log.info("login: trying direct credential sign-in...")
+        if await auto_login(page, username, password, otp_provider):
+            return await ensure_grades_page(page)
+    if otp_provider is not None:
+        log.info("login: trying Inbar SMS-OTP form...")
+        if await otp_login_via_telegram(page, otp_provider):
+            return await ensure_grades_page(page)
+    log.warning("login: all methods failed — still at %s", page.url)
     return False

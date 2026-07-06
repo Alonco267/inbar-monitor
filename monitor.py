@@ -222,6 +222,54 @@ def diff_and_alert(old: dict, new: dict, sender=None) -> None:
         print(f"[DIFF] {len(alerts)} alert(s) sent.")
 
 
+# ─── Local OTP provider (Telegram chat, no cloud relay needed) ────────────────
+
+_BOT_OFFSET = {"value": 0}   # shared getUpdates offset (bot loop + OTP waiter)
+_OTP_WAIT_SECS = 300
+
+
+def _poll_chat_for_code(timeout_secs: int = _OTP_WAIT_SECS) -> str | None:
+    """Poll Telegram for a 4-8 digit message (the SMS code typed by the user)."""
+    import re
+    deadline = _time.monotonic() + timeout_secs
+    while _time.monotonic() < deadline:
+        for u in _fetch_updates(_BOT_OFFSET["value"]):
+            _BOT_OFFSET["value"] = u.get("update_id", 0) + 1
+            text = (u.get("message", {}).get("text") or "").strip()
+            if re.fullmatch(r"\d{4,8}", text):
+                print("[LOGIN] OTP code received via Telegram")
+                return text
+    print("[LOGIN] Timed out waiting for OTP code in Telegram chat")
+    return None
+
+
+async def _telegram_otp_provider() -> str | None:
+    """Ask the owner for the SMS code in the Telegram chat and wait for it."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return None
+    send_telegram(
+        "🔐 נדרש קוד אימות כדי להתחבר לאינ-בר.\n"
+        "נשלח אליך SMS — שלח/י לי כאן את הקוד (ספרות בלבד)."
+    )
+    return await asyncio.to_thread(_poll_chat_for_code)
+
+
+async def _attempt_relogin(page, ctx) -> bool:
+    """Automatic re-login with .env credentials; refreshes saved cookies."""
+    username = os.environ.get("INBAR_USERNAME", "")
+    password = os.environ.get("INBAR_PASSWORD", "")
+    print(f"[LOGIN] Session expired (at {page.url[:80]}) — attempting automatic re-login...")
+    ok = await _login.handle_login(page, username, password, None,
+                                   otp_provider=_telegram_otp_provider)
+    if ok:
+        await ctx.storage_state(path=str(STORAGE_FILE))
+        _lock(STORAGE_FILE)
+        print("[LOGIN] Re-login succeeded — refreshed session saved.")
+    else:
+        print("[LOGIN] Automatic re-login failed — see stages above for the failing step.")
+    return ok
+
+
 # ─── Browser session management ───────────────────────────────────────────────
 
 async def _wait_for_manual_login(page) -> None:
@@ -262,7 +310,9 @@ async def get_authenticated_context(playwright):
             if is_on_grades_page(page.url):
                 print("[BROWSER] Session valid — running headless.")
                 return browser, ctx, page
-            print(f"[BROWSER] Session expired (at: {page.url}).")
+            # Session expired — try automatic re-login before bothering the user
+            if await _attempt_relogin(page, ctx):
+                return browser, ctx, page
         except Exception as e:
             print(f"[BROWSER] Headless error: {e}")
         await ctx.close()
@@ -540,10 +590,10 @@ async def _check_inbar_connection() -> tuple[bool, str]:
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=25_000)
             await page.wait_for_timeout(1_500)
 
-            if not is_on_grades_page(page.url):
+            if not is_on_grades_page(page.url) and not await _attempt_relogin(page, ctx):
                 await ctx.close()
                 await browser.close()
-                return False, "מנותב לדף התחברות — session פג."
+                return False, "session פג וההתחברות האוטומטית נכשלה."
 
             from inbar.config import FILTER_DDL_SEL, GRADES_TABLE_SEL
             try:
@@ -581,8 +631,10 @@ async def _fetch_gpa_live() -> str | None:
         try:
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=25_000)
             await page.wait_for_timeout(1_500)
-            if not is_on_grades_page(page.url):
+            if not is_on_grades_page(page.url) and not await _attempt_relogin(page, ctx):
+                print("[BOT] GPA aborted — no valid session and re-login failed")
                 return None
+            print("[BOT] Session OK — opening averages page...")
             return await _scrape.extract_gpa(page)
         except Exception as e:
             print(f"[BOT] GPA fetch error: {e}")
@@ -607,8 +659,10 @@ async def _handle_update(update: dict) -> int:
     register_user(sender_id)
 
     if BTN_GPA in text or "ממוצע" in text or text.lower().startswith("/gpa"):
+        print("[BOT] Handler: GPA — live-scraping averages page")
         _send_with_keyboard("מחשב את הממוצע שלך... ⏳", chat_id=sender_id)
         gpa = await _fetch_gpa_live()
+        print(f"[BOT] GPA result: {'ok' if gpa else 'FAILED'}")
         if gpa:
             _send_with_keyboard(gpa, chat_id=sender_id)
         else:
@@ -619,12 +673,16 @@ async def _handle_update(update: dict) -> int:
             )
 
     elif BTN_GRADES in text or "ציונים" in text:
+        print("[BOT] Handler: grades list — formatting saved snapshot")
         reply = _build_final_grades_message()
         _send_with_keyboard(reply, chat_id=sender_id)
+        print("[BOT] Grades list sent")
 
     elif BTN_CONNECTION in text or "מחובר" in text:
+        print("[BOT] Handler: connection check — verifying Inbar session")
         _send_with_keyboard("בודק חיבור לאינ-בר... ⏳", chat_id=sender_id)
         connected, detail = await _check_inbar_connection()
+        print(f"[BOT] Connection check → {'connected' if connected else f'NOT connected ({detail})'}")
         if connected:
             has_cache = DATA_FILE.exists() and DATA_FILE.stat().st_size > 10
             cache_line = (
@@ -666,11 +724,10 @@ async def run_bot() -> None:
         _send_with_keyboard(startup_msg, chat_id=uid)
     print("[BOT] Keyboard sent. Listening for commands...")
 
-    offset = 0
     while True:
-        updates = await asyncio.to_thread(_fetch_updates, offset)
+        updates = await asyncio.to_thread(_fetch_updates, _BOT_OFFSET["value"])
         for update in updates:
-            offset = await _handle_update(update)
+            _BOT_OFFSET["value"] = await _handle_update(update)
 
 
 # ─── One-shot monitor (manual login/verification mode) ────────────────────────

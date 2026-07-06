@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from urllib.parse import urljoin
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -215,17 +216,22 @@ async def extract_gpa(page) -> str | None:
         override = os.environ.get("INBAR_AVERAGES_URL", "").strip()
         if override:
             candidates.append(override)
+        if fallback_href:
+            candidates.append(urljoin(page.url, fallback_href))
         candidates.append(DEFAULT_AVERAGES_URL)
-        if fallback_href and fallback_href.startswith("http"):
-            candidates.append(fallback_href)
 
         for url in candidates:
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
-                await page.wait_for_timeout(1_500)
             except Exception as e:
                 log.info("averages URL %s failed: %s", url, e)
                 continue
+            # The averages table renders via an AJAX postback after the initial
+            # page load — wait for its known label instead of a fixed delay.
+            try:
+                await page.wait_for_selector('text=ממוצע כללי', timeout=10_000)
+            except PlaywrightTimeoutError:
+                await page.wait_for_timeout(2_000)
             text = await _read_averages_text(page)
             if text:
                 return text
@@ -240,32 +246,35 @@ async def extract_gpa(page) -> str | None:
 async def _read_averages_text(page) -> str | None:
     """Pull average labels+values out of the current page.
 
-    The averages page renders label/value pairs (and/or a small table) whose
-    labels contain "ממוצע". We collect every visible line that mentions an
-    average together with a number, which is robust to layout changes.
+    The averages page (StudentAverage.aspx) renders each average as a label
+    cell followed by a numeric value cell, e.g.:
+
+        <td><span id="…lblTotalAvg">ממוצע כללי :</span></td>
+        <td><span id="…lblTotalAvgVal">85.71</span></td>
+
+    The label and value live in *sibling <td>s* (verified live 2026-07-06),
+    so we pair each short label cell mentioning "ממוצע" with the next numeric
+    cell. Cells that already contain both label and number are kept as-is
+    for layout resilience.
     """
     try:
         lines: list[str] = await page.evaluate(
             """() => {
                 const out = [];
                 const seen = new Set();
-                const els = document.querySelectorAll('td, th, span, label, div, li');
-                for (const el of els) {
-                    if (el.children.length > 0) continue;   // leaf nodes only
-                    const t = (el.innerText || '').trim().replace(/\\s+/g, ' ');
-                    if (!t || t.length > 120) continue;
-                    if (!t.includes('ממוצע')) {
-                        // value cell next to a label cell
-                        const prev = el.previousElementSibling;
-                        const prevT = prev && prev.children.length === 0
-                            ? (prev.innerText || '').trim() : '';
-                        if (prevT.includes('ממוצע') && /^\\d+(\\.\\d+)?$/.test(t)) {
-                            const line = prevT + ': ' + t;
-                            if (!seen.has(line)) { seen.add(line); out.push(line); }
-                        }
-                        continue;
+                const push = (line) => {
+                    if (line && !seen.has(line)) { seen.add(line); out.push(line); }
+                };
+                const clean = (el) =>
+                    ((el && el.innerText) || '').trim().replace(/\\s+/g, ' ');
+                for (const cell of document.querySelectorAll('td, th')) {
+                    const label = clean(cell);
+                    if (!label.includes('ממוצע') || label.length > 60) continue;
+                    if (/\\d/.test(label)) { push(label); continue; }
+                    const val = clean(cell.nextElementSibling);
+                    if (/^\\d+(\\.\\d+)?$/.test(val)) {
+                        push(label.replace(/\\s*:\\s*$/, '') + ': ' + val);
                     }
-                    if (/\\d/.test(t) && !seen.has(t)) { seen.add(t); out.push(t); }
                 }
                 return out;
             }"""

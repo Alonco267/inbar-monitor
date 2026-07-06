@@ -8,10 +8,10 @@ from pathlib import Path
 
 TARGET_URL = "https://inbar.biu.ac.il/Live/StudentAssignmentTermList.aspx"
 
-# The "Average Grades" page. The default is Inbar's known averages page name;
-# override with INBAR_AVERAGES_URL if the deployment differs. extract_gpa()
-# also falls back to following a menu link whose text contains "ממוצע".
-DEFAULT_AVERAGES_URL = "https://inbar.biu.ac.il/Live/StudentGradesAverage.aspx"
+# The "Average Grades" page ("ממוצע ציונים" in the nav tree — verified live
+# 2026-07-06). Override with INBAR_AVERAGES_URL if the deployment differs.
+# extract_gpa() also falls back to following a menu link containing "ממוצע".
+DEFAULT_AVERAGES_URL = "https://inbar.biu.ac.il/Live/StudentAverage.aspx"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
