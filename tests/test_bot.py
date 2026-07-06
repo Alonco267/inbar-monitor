@@ -73,6 +73,26 @@ async def test_grades_reply_goes_to_sender_not_owner(api, no_io, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_gpa_button_routes_to_live_scrape(api, no_io, monkeypatch):
+    """Pressing BTN_GPA reaches _fetch_gpa_live and returns its text to sender."""
+    monkeypatch.setattr(monitor, "_fetch_gpa_live",
+                        AsyncMock(return_value="ממוצע כללי: 92.5"))
+    await monitor._handle_update(_upd(monitor.BTN_GPA, chat_id=777))
+    texts = _texts_to(api, 777)
+    assert any("92.5" in t for t in texts)
+    assert "777" in _sent_to(api)
+
+
+@pytest.mark.asyncio
+async def test_gpa_button_handles_scrape_failure(api, no_io, monkeypatch):
+    """When GPA scrape returns None the user gets a graceful fallback, not a crash."""
+    monkeypatch.setattr(monitor, "_fetch_gpa_live", AsyncMock(return_value=None))
+    await monitor._handle_update(_upd(monitor.BTN_GPA, chat_id=555))
+    texts = _texts_to(api, 555)
+    assert any("לא הצלחתי" in t for t in texts)
+
+
+@pytest.mark.asyncio
 async def test_connection_reply_goes_to_sender(api, no_io, monkeypatch):
     monkeypatch.setattr(monitor, "_check_inbar_connection",
                         AsyncMock(return_value=(True, "ok")))

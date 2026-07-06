@@ -66,6 +66,7 @@ _CRIT_DAYS      = 6   # critical window starts 6 days after exam
 # ─── Bot keyboard button labels ───────────────────────────────────────────────
 BTN_GRADES     = "📊 רשימת הציונים הסופיים שלי"
 BTN_CONNECTION = "🔌 האם אני מחובר?"
+BTN_GPA        = "🎓 הממוצע שלי"
 
 
 # ─── Compatibility re-exports (tests + monitor_once import these) ─────────────
@@ -123,6 +124,7 @@ def _send_with_keyboard(text: str, chat_id: str = None) -> None:
     keyboard = {
         "keyboard": [
             [{"text": BTN_GRADES}],
+            [{"text": BTN_GPA}],
             [{"text": BTN_CONNECTION}],
         ],
         "resize_keyboard": True,
@@ -564,6 +566,32 @@ async def _check_inbar_connection() -> tuple[bool, str]:
             return False, str(e)
 
 
+async def _fetch_gpa_live() -> str | None:
+    """Live-scrape the official averages ("הממוצע שלי") using the saved session.
+
+    Mirrors the production path (monitor_once.py → inbar.scrape.extract_gpa) so
+    the local bot shows the exact same GPA text. Returns None on any failure —
+    a GPA lookup must never crash the bot.
+    """
+    if not STORAGE_FILE.exists():
+        return None
+
+    async with async_playwright() as pw:
+        browser, ctx, page = await _open_headless(pw)
+        try:
+            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=25_000)
+            await page.wait_for_timeout(1_500)
+            if not is_on_grades_page(page.url):
+                return None
+            return await _scrape.extract_gpa(page)
+        except Exception as e:
+            print(f"[BOT] GPA fetch error: {e}")
+            return None
+        finally:
+            await ctx.close()
+            await browser.close()
+
+
 async def _handle_update(update: dict) -> int:
     """Process one Telegram update. Returns next offset."""
     msg       = update.get("message", {})
@@ -578,7 +606,19 @@ async def _handle_update(update: dict) -> int:
 
     register_user(sender_id)
 
-    if BTN_GRADES in text or "ציונים" in text:
+    if BTN_GPA in text or "ממוצע" in text or text.lower().startswith("/gpa"):
+        _send_with_keyboard("מחשב את הממוצע שלך... ⏳", chat_id=sender_id)
+        gpa = await _fetch_gpa_live()
+        if gpa:
+            _send_with_keyboard(gpa, chat_id=sender_id)
+        else:
+            _send_with_keyboard(
+                "לא הצלחתי לקרוא את הממוצע כרגע.\n"
+                "ודא/י שה-session מחובר (הרץ `python monitor.py`) ונסה/י שוב.",
+                chat_id=sender_id,
+            )
+
+    elif BTN_GRADES in text or "ציונים" in text:
         reply = _build_final_grades_message()
         _send_with_keyboard(reply, chat_id=sender_id)
 
