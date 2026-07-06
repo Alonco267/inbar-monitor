@@ -468,9 +468,11 @@ async def run_daemon() -> None:
     print("[DAEMON] Inbar Grade Monitor — always-on mode started")
 
     _EXPIRED_FLAG = BASE_DIR / ".session_expired_notified"
+    _MAX_LOGIN_FAILURES = 3   # notify only after 3 consecutive failed re-logins
 
     next_check = 0.0
     next_ping  = 0.0
+    login_failures = 0
     warned_expired = _EXPIRED_FLAG.exists()   # survive restarts — don't re-spam
     baseline_saved = False
     notified_running = False                  # send "monitoring" only after first success
@@ -523,7 +525,8 @@ async def run_daemon() -> None:
                         logged_in = await _handle_login(page, _username, _password,
                                                         _relay_url, _token)
                         if not logged_in:
-                            if not warned_expired:
+                            login_failures += 1
+                            if login_failures >= _MAX_LOGIN_FAILURES and not warned_expired:
                                 _notify(
                                     "ההתחברות לאינ-בר פגה 🔑\n"
                                     "פתח/י אינ-בר בדפדפן, התחבר/י — הבוט ימשיך אוטומטית.\n"
@@ -532,9 +535,12 @@ async def run_daemon() -> None:
                                 warned_expired = True
                                 _EXPIRED_FLAG.touch()
                             next_check = _time.monotonic() + 600
-                            print("[DAEMON] Session expired — retry in 10 min")
+                            print(f"[DAEMON] Re-login failed "
+                                  f"({login_failures}/{_MAX_LOGIN_FAILURES} before alert) "
+                                  f"— retry in 10 min")
                             continue
 
+                    login_failures = 0
                     if warned_expired:
                         warned_expired = False
                         _EXPIRED_FLAG.unlink(missing_ok=True)
