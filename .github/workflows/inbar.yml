@@ -1,0 +1,60 @@
+name: Inbar grade check
+
+on:
+  schedule:
+    # Every 5 minutes during daytime Israel hours.
+    # GitHub cron is UTC. Israel is UTC+2 (winter) / UTC+3 (DST), so the
+    # window below is roughly 07:00–22:55 local in winter, 08:00–23:55 in DST.
+    # WARNING: a private repo will burn ~9,500 Actions minutes/month at this
+    # rate (free tier = 2,000). Make the repo public for unlimited free Actions.
+    - cron: "*/5 5-20 * * *"
+  workflow_dispatch:        # manual "Run workflow" button
+
+concurrency:
+  group: inbar-check
+  cancel-in-progress: false  # don't kill an in-flight OTP login
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8       # plenty for scrape; allows OTP wait if needed
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Cache Playwright's Chromium binary across runs (~100MB).
+      # Cache key tied to requirements.txt so a Playwright version bump
+      # invalidates it automatically.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Python deps (always runs, fast — pip cache hits)
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser (download only on cache miss)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Install Playwright OS deps (system libs only, browser cached)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
+
+      - name: Run one-shot grade check
+        env:
+          RELAY_URL:      ${{ secrets.RELAY_URL }}
+          DAEMON_TOKEN:   ${{ secrets.DAEMON_TOKEN }}
+          INBAR_USERNAME: ${{ secrets.INBAR_USERNAME }}
+          INBAR_PASSWORD: ${{ secrets.INBAR_PASSWORD }}
+          INBAR_ID:       ${{ secrets.INBAR_ID }}
+          INBAR_PHONE:    ${{ secrets.INBAR_PHONE }}
+        run: python monitor_once.py
