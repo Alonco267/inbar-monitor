@@ -31,6 +31,13 @@
   <key>StandardErrorPath</key>
   <string>__WORK_DIR__/logs/bot_error.log</string>
 
+  <!-- Flush Python stdout/stderr immediately to log files -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
   <!-- Start at login -->
   <key>RunAtLoad</key>
   <true/>
