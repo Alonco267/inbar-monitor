@@ -257,6 +257,54 @@ async def _telegram_otp_provider() -> str | None:
     return await asyncio.to_thread(_poll_chat_for_code)
 
 
+# ─── Daemon↔bot OTP handoff (the bot owns getUpdates; the daemon can't poll) ──
+#
+# The monitor daemon prompts the owner in Telegram, then waits for the bot
+# process (the only getUpdates consumer) to drop the digits it receives into
+# a reply file.
+
+_OTP_REQUEST_FILE = BASE_DIR / ".otp_request"
+_OTP_REPLY_FILE   = BASE_DIR / ".otp_reply"
+_OTP_REQUEST_MAX_AGE = _OTP_WAIT_SECS   # a request older than this is stale
+
+
+def _otp_request_pending() -> bool:
+    """True if the daemon is currently waiting for an SMS code."""
+    try:
+        age = _time.time() - float(_OTP_REQUEST_FILE.read_text().strip())
+        return 0 <= age <= _OTP_REQUEST_MAX_AGE
+    except (OSError, ValueError):
+        return False
+
+
+async def _daemon_chat_otp_provider() -> str | None:
+    """Daemon-side OTP: prompt the owner in Telegram, wait for the bot process
+    to relay the code via the reply file (up to 5 min)."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return None
+    _OTP_REPLY_FILE.unlink(missing_ok=True)
+    _OTP_REQUEST_FILE.write_text(str(_time.time()))
+    send_telegram(
+        "🔐 נדרש קוד אימות כדי להתחבר לאינ-בר.\n"
+        "נשלח אליך SMS לטלפון — שלח/י לי כאן את הקוד (ספרות בלבד)."
+    )
+    print("[LOGIN] OTP prompt sent — waiting for code via bot (up to 5 min)")
+    deadline = _time.monotonic() + _OTP_WAIT_SECS
+    try:
+        while _time.monotonic() < deadline:
+            await asyncio.sleep(2)
+            if _OTP_REPLY_FILE.exists():
+                code = _OTP_REPLY_FILE.read_text().strip()
+                _OTP_REPLY_FILE.unlink(missing_ok=True)
+                if code:
+                    print("[LOGIN] OTP code received from bot")
+                    return code
+        print("[LOGIN] Timed out waiting for OTP code")
+        return None
+    finally:
+        _OTP_REQUEST_FILE.unlink(missing_ok=True)
+
+
 async def _attempt_relogin(page, ctx) -> bool:
     """Automatic re-login with .env credentials; refreshes saved cookies."""
     username = os.environ.get("INBAR_USERNAME", "")
@@ -522,8 +570,12 @@ async def run_daemon() -> None:
 
                     if not is_on_grades_page(page.url):
                         print(f"[DAEMON] Redirected to: {page.url}")
-                        logged_in = await _handle_login(page, _username, _password,
-                                                        _relay_url, _token)
+                        # OTP via Telegram chat (bot relays the code); the
+                        # Cloudflare relay remains the fallback provider.
+                        _otp = (_daemon_chat_otp_provider
+                                if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else None)
+                        logged_in = await _login.handle_login(
+                            page, _username, _password, relay, otp_provider=_otp)
                         if not logged_in:
                             login_failures += 1
                             if login_failures >= _MAX_LOGIN_FAILURES and not warned_expired:
@@ -667,6 +719,15 @@ async def _handle_update(update: dict) -> int:
     print(f"[BOT] Received from {sender_id}: {text!r}")
 
     register_user(sender_id)
+
+    # OTP handoff: the monitor daemon is waiting for an SMS code — relay it.
+    import re
+    if (re.fullmatch(r"\d{4,8}", text) and sender_id == TELEGRAM_CHAT_ID
+            and _otp_request_pending()):
+        _OTP_REPLY_FILE.write_text(text)
+        print("[BOT] OTP code relayed to monitor daemon")
+        _send_with_keyboard("קיבלתי את הקוד ✅ מתחבר לאינ-בר...", chat_id=sender_id)
+        return update_id + 1
 
     if BTN_GPA in text or "ממוצע" in text or text.lower().startswith("/gpa"):
         print("[BOT] Handler: GPA — live-scraping averages page")
