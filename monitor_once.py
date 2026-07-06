@@ -1,121 +1,113 @@
 #!/usr/bin/env python3
 """
-One-shot grade check for cron / GitHub Actions.
+One-shot grade check for cron / GitHub Actions — the PRODUCTION monitoring path.
 
-Pulls browser-session state (Playwright `storage_state`) and last-seen grades
-from the Cloudflare Worker KV via the inbar-relay endpoints, runs a headless
-scrape, sends alerts via the relay's /alert endpoint, and pushes updated state
-back. No local files, no persistent profile — designed to run on ephemeral
-CI runners.
+Pulls browser-session state (Playwright `storage_state`), last-seen grades and
+the ever-alerted dedup set from the Cloudflare Worker KV via the inbar-relay
+endpoints, runs a headless scrape, sends alerts via the relay, and pushes
+updated state back. No local files, no persistent profile — designed for
+ephemeral CI runners.
 
 Required env vars:
-  RELAY_URL          e.g. https://inbar-relay.alonco267.workers.dev
+  RELAY_URL          e.g. https://inbar-relay.example.workers.dev
   DAEMON_TOKEN       the per-user random hex token bound to your Telegram chat
   INBAR_USERNAME     for auto-login when session expires
   INBAR_PASSWORD     ^
 
-Optional env vars (OTP fallback if auto-login alone fails):
-  INBAR_ID           Israeli ID for the OTP form
-  INBAR_PHONE        phone for the OTP form
+Optional env vars:
+  INBAR_ID           Israeli ID for the OTP fallback form
+  INBAR_PHONE        phone for the OTP fallback form
+  INBAR_AVERAGES_URL override for the official "Average Grades" page
+
+Login-failure policy (3-strike):
+  Consecutive login failures are counted in relay state. After the 3rd
+  consecutive failure ONE Telegram alert is sent; further failures stay
+  silent. The cron keeps retrying every run, and on the first successful
+  login after a notification a single recovery message is sent.
 
 Exit codes:
-  0  success (scrape ran, alerts dispatched, state saved)
-  1  unrecoverable error (missing config, login totally failed, etc.)
+  0  success, paused, or handled login failure (retry next cron tick)
+  1  unrecoverable error (missing config, repeated scrape crashes)
 """
 
+from __future__ import annotations
+
 import asyncio
-import json
+import logging
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
-import requests
 from playwright.async_api import async_playwright
 
-# Reuse extraction + diffing logic from the daemon module.
-import monitor as m
+from inbar.config import CONTEXT_OPTS, TARGET_URL, setup_logging
+from inbar.diff import (baseline_dedup_ids, compute_alerts, filter_alerts,
+                        migrate_ever_seen)
+from inbar.formatting import build_final_grades_message
+from inbar.login import LoginFailed, handle_login
+from inbar.relay import RelayClient
+from inbar.scrape import extract_gpa, extract_grades
+
+log = logging.getLogger("inbar.once")
+
+LOGIN_FAILURE_THRESHOLD = 3
+MAX_ATTEMPTS = 3
+
+LOGIN_EXPIRED_MSG = (
+    "ההתחברות לאינ-בר פגה 🔑\n"
+    "ניסיתי להתחבר מחדש 3 פעמים ברצף ללא הצלחה.\n"
+    "אמשיך לנסות ברקע אוטומטית — אם יש בעיה בסיסמה/חשבון, עדכן/י את הסודות."
+)
+LOGIN_RECOVERED_MSG = "🟢 החיבור לאינ-בר התאושש — הניטור חזר לפעול כרגיל."
 
 
 def _env(name: str, required: bool = True) -> str:
     v = os.environ.get(name, "").strip()
     if required and not v:
-        print(f"[ONCE] missing required env var: {name}", file=sys.stderr)
+        log.error("missing required env var: %s", name)
         sys.exit(1)
     return v
 
 
-def _load_state(relay_url: str, token: str) -> dict | None:
-    """GET /state — returns the parsed JSON blob, or None if no state yet."""
+def _extract_ever_alerted(state: dict) -> dict:
+    """Read the dedup set from state, migrating the legacy ever_seen format."""
+    if "ever_alerted" in state:
+        return dict(state.get("ever_alerted") or {})
+    legacy = state.get("ever_seen") or {}
+    if legacy:
+        log.info("migrating legacy ever_seen (%d entries) → ever_alerted", len(legacy))
+        return migrate_ever_seen(legacy)
+    return {}
+
+
+async def _dump_login_page(page) -> None:
+    """Save the page we got stuck on so selectors can be fixed offline."""
     try:
-        r = requests.get(f"{relay_url}/state", params={"token": token}, timeout=15)
-    except requests.RequestException as e:
-        print(f"[ONCE] state GET failed: {e}", file=sys.stderr)
-        return None
-    if r.status_code != 200:
-        print(f"[ONCE] state GET → HTTP {r.status_code}: {r.text}", file=sys.stderr)
-        return None
-    blob = r.json().get("state")
-    if not blob:
-        return None
-    try:
-        return json.loads(blob)
-    except json.JSONDecodeError:
-        print("[ONCE] state blob is not valid JSON — ignoring", file=sys.stderr)
-        return None
+        html = await page.content()
+        Path("debug_login_page.html").write_text(html, encoding="utf-8")
+        log.warning("dumped login page HTML (%d chars)", len(html))
+    except Exception as dump_err:
+        log.warning("could not dump page: %s", dump_err)
 
 
-def _save_state(relay_url: str, token: str, state: dict) -> bool:
-    body = {"token": token, "state": json.dumps(state, separators=(",", ":"))}
-    try:
-        r = requests.put(f"{relay_url}/state", json=body, timeout=15)
-    except requests.RequestException as e:
-        print(f"[ONCE] state PUT failed: {e}", file=sys.stderr)
-        return False
-    if r.status_code != 200:
-        print(f"[ONCE] state PUT → HTTP {r.status_code}: {r.text}", file=sys.stderr)
-        return False
-    return True
+async def _scrape_attempt(relay: RelayClient, username: str, password: str,
+                          state: dict) -> dict:
+    """Single browser scrape + alert attempt.
 
-
-def _send_alert(relay_url: str, token: str, text: str) -> None:
-    try:
-        r = requests.post(f"{relay_url}/alert", json={"token": token, "text": text}, timeout=15)
-        if r.status_code != 200:
-            print(f"[ONCE] alert → HTTP {r.status_code}: {r.text}", file=sys.stderr)
-    except requests.RequestException as e:
-        print(f"[ONCE] alert failed: {e}", file=sys.stderr)
-
-
-def _push_grades_summary(relay_url: str, token: str, grades: dict) -> None:
-    # Reuse the daemon's formatter. It reads from disk (DATA_FILE) so we
-    # temporarily overwrite that path with our in-memory grades. Cheaper than
-    # duplicating the formatting logic.
-    m.DATA_FILE.write_text(json.dumps(grades, ensure_ascii=False, indent=2), encoding="utf-8")
-    summary = m._build_final_grades_message()
-    try:
-        requests.post(f"{relay_url}/grades-summary",
-                      json={"token": token, "summary": summary}, timeout=15)
-    except requests.RequestException as e:
-        print(f"[ONCE] summary push failed: {e}", file=sys.stderr)
-
-
-async def _scrape_attempt(
-    relay_url: str, token: str, username: str, password: str,
-    storage_state, old_grades: dict, ever_seen: dict,
-) -> int:
+    Returns the new state dict to persist. Raises LoginFailed when no login
+    method works, or any other exception for retryable failures.
     """
-    Single browser scrape + alert attempt.
-    Raises on unrecoverable errors so the caller can retry.
-    Returns 0 on success, 1 on non-retryable failure (e.g. login totally failed).
-    """
-    from urllib.parse import urlparse
+    storage_state = state.get("storage_state")
+    old_grades = state.get("grades", {})
+    ever_alerted = _extract_ever_alerted(state)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
             args=["--disable-blink-features=AutomationControlled"],
         )
-        ctx_kwargs = dict(m.CONTEXT_OPTS)
+        ctx_kwargs = dict(CONTEXT_OPTS)
         if storage_state:
             ctx_kwargs["storage_state"] = storage_state
         ctx = await browser.new_context(**ctx_kwargs)
@@ -125,118 +117,121 @@ async def _scrape_attempt(
         page = await ctx.new_page()
 
         try:
-            await page.goto(m.TARGET_URL, wait_until="domcontentloaded", timeout=30_000)
+            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(2_000)
 
-            def on_grades_url():
+            def on_grades_url() -> bool:
                 return "StudentAssignmentTermList" in urlparse(page.url).path
 
             if not on_grades_url():
-                print(f"[ONCE] not on grades page (at: {page.url}) — attempting login")
-                ok = await m._handle_login(page, username, password, relay_url, token)
-                if not ok:
-                    try:
-                        html = await page.content()
-                        Path("debug_login_page.html").write_text(html, encoding="utf-8")
-                        print(f"[ONCE] dumped page HTML ({len(html)} chars)", file=sys.stderr)
-                        inputs = await page.eval_on_selector_all(
-                            "input",
-                            "els => els.map(e => ({tag:e.tagName, type:e.type, name:e.name, "
-                            "id:e.id, placeholder:e.placeholder, visible:e.offsetParent!==null}))"
-                        )
-                        for inp in inputs:
-                            print(f"  {inp}", file=sys.stderr)
-                    except Exception as dump_err:
-                        print(f"[ONCE] could not dump page: {dump_err}", file=sys.stderr)
-                    print("[ONCE] login failed — non-retryable", file=sys.stderr)
-                    return 1   # login failure: don't retry (would just fail again)
+                log.info("not on grades page (at: %s) — attempting login", page.url)
+                if not await handle_login(page, username, password, relay):
+                    await _dump_login_page(page)
+                    raise LoginFailed(f"all login methods failed at {page.url}")
                 if not on_grades_url():
-                    print(f"[ONCE] navigating from {page.url} to grades page")
-                    await page.goto(m.TARGET_URL, wait_until="domcontentloaded", timeout=30_000)
+                    await page.goto(TARGET_URL, wait_until="domcontentloaded",
+                                    timeout=30_000)
                     await page.wait_for_timeout(2_000)
 
-            print("[ONCE] extracting grades...")
-            grades = await m.extract_grades(page)
+            log.info("extracting grades...")
+            grades = await extract_grades(page)
             if not grades:
                 raise RuntimeError("no grades extracted — page may have changed")
+            log.info("%d row(s) parsed", len(grades))
 
-            print(f"[ONCE] {len(grades)} row(s) parsed")
-
-            # Build merged_old: old_grades enriched with ever_seen so that grades
-            # we've already alerted on look "old" to diff_and_alert — even if
-            # the KV state was lost between runs.
-            merged_old: dict = dict(old_grades)
-            for key, seen in ever_seen.items():
-                entry = dict(merged_old.get(key, {}))
-                if not m._is_empty(seen.get("grade", "")):
-                    entry["grade"] = seen["grade"]
-                if not m._is_empty(seen.get("final_grade", "")):
-                    entry["final_grade"] = seen["final_grade"]
-                merged_old[key] = entry
-
-            if old_grades or ever_seen:
-                m.diff_and_alert(
-                    merged_old,
-                    grades,
-                    sender=lambda text: _send_alert(relay_url, token, text),
-                )
+            is_first_run = not old_grades and not ever_alerted
+            if is_first_run:
+                log.info("first run — saving baseline without alerting")
+                ever_alerted = baseline_dedup_ids(grades)
             else:
-                print("[ONCE] first run — saving baseline without alerting")
+                alerts = compute_alerts(old_grades, grades)
+                to_send, ever_alerted = filter_alerts(alerts, ever_alerted)
+                for alert in to_send:
+                    log.info("alert [%s] %s", alert.kind, alert.key)
+                    relay.send_alert(alert.message)
+                if not to_send:
+                    log.info("no new changes")
 
-            # Expand ever_seen with any graded entries from this scrape.
-            new_ever_seen: dict = dict(ever_seen)
-            for key, info in grades.items():
-                grade = info.get("grade", "—")
-                fg    = info.get("final_grade", "—")
-                if not m._is_empty(grade) or not m._is_empty(fg):
-                    new_ever_seen[key] = {"grade": grade, "final_grade": fg}
+            # Recovery notice: first success after a login-expired notification.
+            if state.get("login_notified"):
+                relay.send_alert(LOGIN_RECOVERED_MSG)
+                log.info("sent login-recovered notice")
 
-            _push_grades_summary(relay_url, token, grades)
-            requests.post(f"{relay_url}/heartbeat", json={"token": token}, timeout=15)
+            relay.push_grades_summary(build_final_grades_message(grades))
 
-            new_storage_state = await ctx.storage_state()
-            ok = _save_state(relay_url, token, {
-                "storage_state": new_storage_state,
+            # Official GPA — best effort, never fails the run.
+            gpa_text = await extract_gpa(page)
+            if gpa_text:
+                relay.push_gpa(gpa_text)
+                log.info("official GPA pushed to relay")
+            else:
+                log.info("official GPA unavailable this run")
+
+            relay.heartbeat()
+
+            return {
+                "storage_state": await ctx.storage_state(),
                 "grades": grades,
-                "ever_seen": new_ever_seen,
-            })
-            if not ok:
-                print("[ONCE] WARN: state save failed — next run will re-login",
-                      file=sys.stderr)
-            return 0
+                "ever_alerted": ever_alerted,
+                "login_failures": 0,
+                "login_notified": False,
+            }
         finally:
             await ctx.close()
             await browser.close()
 
 
+def _handle_login_failure(relay: RelayClient, state: dict) -> None:
+    """3-strike accounting: notify exactly once, keep retrying via cron."""
+    failures = int(state.get("login_failures", 0)) + 1
+    notified = bool(state.get("login_notified", False))
+    log.warning("login failure #%d (notified=%s)", failures, notified)
+
+    if failures >= LOGIN_FAILURE_THRESHOLD and not notified:
+        if relay.send_alert(LOGIN_EXPIRED_MSG):
+            notified = True
+            log.info("sent one-time login-expired alert")
+
+    new_state = dict(state)
+    new_state["login_failures"] = failures
+    new_state["login_notified"] = notified
+    if not relay.save_state(new_state):
+        log.warning("could not persist failure counter — may recount next run")
+
+
 async def run_once() -> int:
+    setup_logging()
     relay_url = _env("RELAY_URL")
-    token     = _env("DAEMON_TOKEN").lower()
-    username  = _env("INBAR_USERNAME")
-    password  = _env("INBAR_PASSWORD")
+    token = _env("DAEMON_TOKEN").lower()
+    username = _env("INBAR_USERNAME")
+    password = _env("INBAR_PASSWORD")
 
-    state         = _load_state(relay_url, token) or {}
-    storage_state = state.get("storage_state")
-    old_grades    = state.get("grades", {})
-    ever_seen     = state.get("ever_seen", {})   # grows monotonically, never cleared
+    relay = RelayClient(relay_url, token)
+    state, paused = relay.load_state()
 
-    for attempt in range(1, 4):
+    if paused:
+        log.info("monitoring is PAUSED (user request) — skipping run")
+        return 0
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         if attempt > 1:
             wait = 20 * attempt
-            print(f"[ONCE] retry {attempt}/3 — waiting {wait}s...")
+            log.info("retry %d/%d — waiting %ds...", attempt, MAX_ATTEMPTS, wait)
             await asyncio.sleep(wait)
         try:
-            result = await _scrape_attempt(
-                relay_url, token, username, password,
-                storage_state, old_grades, ever_seen,
-            )
-            if result == 1:
-                return 1   # non-retryable (login failure)
+            new_state = await _scrape_attempt(relay, username, password, state)
+            if not relay.save_state(new_state):
+                log.warning("state save failed — next run may re-login")
             return 0
+        except LoginFailed as e:
+            # Not retryable within this run — the same login would fail again.
+            log.warning("login failed: %s", e)
+            _handle_login_failure(relay, state)
+            return 0   # cron keeps retrying; Telegram already notified (once)
         except Exception as e:
-            print(f"[ONCE] attempt {attempt}/3 failed: {e}", file=sys.stderr)
+            log.error("attempt %d/%d failed: %s", attempt, MAX_ATTEMPTS, e)
 
-    print("[ONCE] all 3 attempts failed — giving up", file=sys.stderr)
+    log.error("all %d attempts failed — giving up this run", MAX_ATTEMPTS)
     return 1
 
 

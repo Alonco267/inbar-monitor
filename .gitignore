@@ -15,6 +15,10 @@ browser_session/
 # Logs
 logs/
 
+# Runtime flags & test caches
+.session_expired_notified
+.pytest_cache/
+
 # Python
 venv/
 .venv/

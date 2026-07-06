@@ -1,4 +1,46 @@
-# Production deployment — Inbar Grade Monitor (multi-user, free)
+# Production deployment — Inbar Grade Monitor
+
+## Current production architecture (single-owner, server-side)
+
+The **active** monitoring path is GitHub Actions + the Cloudflare Worker relay:
+
+```
+GitHub Actions cron (*/5)          Cloudflare Worker (inbar-relay)         Telegram
+┌──────────────────────────┐       ┌───────────────────────────────┐      ┌─────────┐
+│ monitor_once.py           │ ◄──── │ cron */5: dispatch backstop   │      │ bot chat │
+│  - loads state from KV    │       │ KV: state/heartbeat/gpa/…     │ ───► │ alerts   │
+│  - Playwright scrape      │ ────► │ /alert /state /gpa /heartbeat │      │ commands │
+│  - diff engine + dedup    │       │ hourly watchdog (pause-aware) │      └─────────┘
+│  - 3-strike login policy  │       └───────────────────────────────┘
+└──────────────────────────┘
+```
+
+Shared Python logic lives in the `inbar/` package (`diff`, `scrape`, `login`,
+`relay`, `formatting`, `textutils`, `config`). `monitor.py` keeps the legacy
+local daemon/bot modes and the manual-login bootstrap.
+
+### Operational behaviors
+
+- **Change detection**: new grades, grade *updates* (up/down), final-grade
+  changes, appeal filed / resolved / status changes, new exam rows. Every
+  alert is deduplicated by `(row, field, value)` in a persistent
+  `ever_alerted` set — no duplicate alerts even if KV state is lost.
+- **Login failures**: counted across runs; ONE Telegram alert after 3
+  consecutive failures, silent retries afterwards, one recovery message when
+  the session comes back.
+- **Pause/resume**: send `/pause` to the bot to silence everything (runs
+  skip, watchdog stays quiet — no false "script stopped" alerts); `/resume`
+  re-enables.
+- **Official GPA**: the "🎓 הממוצע שלי" button (or `/gpa`) returns the
+  averages scraped from Inbar's Average-Grades page each run.
+- **Scheduling backstop**: the Worker cron (`*/5`) fires
+  `workflow_dispatch` via the GitHub API when the heartbeat is >4 min stale
+  (needs `GITHUB_PAT` secret + `GITHUB_REPO`/`GITHUB_WORKFLOW` vars) —
+  covers GitHub cron lag and silent auto-disable.
+
+---
+
+# Multi-user userscript deployment (legacy/alternative, free)
 
 Goal: let up to ~1000 friends use **one** shared Telegram bot,
 with **zero credential storage on any server**.

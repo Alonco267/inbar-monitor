@@ -177,13 +177,16 @@ describe('computePollIntervalMs', () => {
     expect(computePollIntervalMs(grades, dayHour)).toBe(SLOW_POLL_MS);
   });
 
+  // Exam dates below are fixed relative to the fixed fake "now" (2026-05-17),
+  // NOT the real clock — today(-30) rotted once the real date passed dayHour
+  // and made the exam land in the "future" relative to the fake now.
   it('pending, >= 6 days since exam + nighttime → SLOW_POLL_MS (no fast polling at night)', () => {
-    const grades = { k: info({ date: today(-30), grade: '—' }) };
+    const grades = { k: info({ date: '17/04/2026', grade: '—' }) };
     expect(computePollIntervalMs(grades, nightHour)).toBe(SLOW_POLL_MS);
   });
 
   it('pending, >= 6 days since exam + daytime → FAST_POLL_MS', () => {
-    const grades = { k: info({ date: today(-30), grade: '—' }) };
+    const grades = { k: info({ date: '17/04/2026', grade: '—' }) };
     expect(computePollIntervalMs(grades, dayHour)).toBe(FAST_POLL_MS);
   });
 

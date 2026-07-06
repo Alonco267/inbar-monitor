@@ -36,12 +36,25 @@ const MAX_STATE_BYTES = 512 * 1024;         // 512KB — Playwright storage_stat
 
 const BTN_CONNECTED = '🔌 האם אני מחובר?';
 const BTN_GRADES    = '📊 רשימת הציונים';
+const BTN_GPA       = '🎓 הממוצע שלי';
 
 const REPLY_KEYBOARD = {
-  keyboard: [[{ text: BTN_CONNECTED }], [{ text: BTN_GRADES }]],
+  keyboard: [[{ text: BTN_CONNECTED }], [{ text: BTN_GRADES }], [{ text: BTN_GPA }]],
   resize_keyboard: true,
   is_persistent: true
 };
+
+// How stale a heartbeat must be before the cron backstop re-triggers the
+// GitHub workflow. A healthy 5-min cadence leaves the heartbeat 5-7 min old
+// at check time (the run itself takes 1-2 min), so the threshold must be
+// comfortably above one full cycle: two missed cycles + runtime slack.
+const DISPATCH_STALE_MS = 12 * 60 * 1000;
+
+// The GitHub workflow cron only runs 05:00-20:55 UTC (Israel daytime).
+// The backstop must respect the same quiet window or it would dispatch
+// all night against an intentionally idle schedule.
+const DISPATCH_UTC_START = 5;
+const DISPATCH_UTC_END = 20;   // inclusive
 
 // Direct store links — the free versions never ask for payment from the store
 // install flow. (The marketing site tampermonkey.net pushes a paid "Pro"
@@ -59,39 +72,60 @@ const WATCHDOG_STALE_MS = 60 * 60 * 1000;          // 60 min
 const WATCHDOG_REWARN_TTL = 60 * 60 * 24;           // 24 hours (KV TTL, in seconds)
 
 export default {
-  async scheduled(_event, env, _ctx) {
-    // Iterate every linked user (keys without prefixes are tokens) and check
-    // their heartbeat freshness. KV list() returns at most 1000 keys per page
-    // — fine for any realistic single-bot deployment.
-    let cursor;
+  async scheduled(event, env, _ctx) {
+    // Runs every 5 minutes (see wrangler.toml). Two duties:
+    //   1. Scheduling backstop: GitHub's cron is best-effort (delays of
+    //      5–30 min, silent auto-disable after repo inactivity). If any
+    //      active user's heartbeat is stale, fire workflow_dispatch.
+    //   2. Hourly watchdog: warn users whose monitor went silent —
+    //      unless they intentionally paused it (no false alarms).
     const now = Date.now();
+    const when = new Date(event?.scheduledTime || now);
+    const runWatchdog = when.getMinutes() === 0;   // hourly, on the hour
+    const hourUTC = when.getUTCHours();
+    const inDispatchWindow =
+      hourUTC >= DISPATCH_UTC_START && hourUTC <= DISPATCH_UTC_END;
+
+    let needDispatch = false;
+    let cursor;
     do {
       const page = await env.TOKENS.list({ cursor });
       for (const { name: key } of page.keys) {
-        // Skip non-token keys (they contain a colon, e.g. `chat:123`, `heartbeat:abc`).
+        // Skip non-token keys (they contain a colon, e.g. `chat:123`).
         if (key.includes(':')) continue;
         if (!TOKEN_RE.test(key)) continue;
         const token = key;
         const chatId = await env.TOKENS.get(token);
         if (!chatId) continue;
 
+        // Intentionally paused → no dispatch, no warnings. This is the fix
+        // for false "script stopped" alerts when monitoring is disabled.
+        if (await env.TOKENS.get(`paused:${token}`)) continue;
+
+        const hbStr = await env.TOKENS.get(`heartbeat:${token}`);
+        if (!hbStr) continue;   // never reported — nothing to act on yet
+        const hb = parseInt(hbStr, 10);
+        const age = now - hb;
+
+        if (inDispatchWindow && age >= DISPATCH_STALE_MS) needDispatch = true;
+
+        if (!runWatchdog) continue;
+        if (age < WATCHDOG_STALE_MS) continue;
         // Suppress if we already warned recently.
         if (await env.TOKENS.get(`warned:${token}`)) continue;
 
-        const hbStr = await env.TOKENS.get(`heartbeat:${token}`);
-        if (!hbStr) continue;   // never reported — nothing to warn about yet
-        const hb = parseInt(hbStr, 10);
-        if (now - hb < WATCHDOG_STALE_MS) continue;
-
-        const ageLabel = formatAgo(now - hb);
+        const ageLabel = formatAgo(age);
         await sendTelegram(env, chatId,
           `⚠️ הסקריפט הפסיק לרוץ.\nעדכון אחרון: ${ageLabel}.\n` +
-          `בדוק/י ב-GitHub Actions שהריצות מצליחות, או שאת/ה לא חסום/ה ע"י אינ-בר.`);
+          `בדוק/י ב-GitHub Actions שהריצות מצליחות, או שאת/ה לא חסום/ה ע"י אינ-בר.\n` +
+          `(אם השבתת בכוונה — שלח/י /pause ולא אציק יותר.)`);
         await env.TOKENS.put(`warned:${token}`, String(now),
           { expirationTtl: WATCHDOG_REWARN_TTL });
       }
       cursor = page.list_complete ? null : page.cursor;
     } while (cursor);
+
+    if (needDispatch) await triggerGithubWorkflow(env);
   },
 
   async fetch(request, env) {
@@ -115,6 +149,9 @@ export default {
     }
     if (request.method === 'POST' && url.pathname === '/grades-summary') {
       return handleGradesSummary(request, env);
+    }
+    if (request.method === 'POST' && url.pathname === '/gpa') {
+      return handlePutGpa(request, env);
     }
     if (request.method === 'POST' && url.pathname === '/unlink') {
       return handleUnlink(request, env);
@@ -225,9 +262,89 @@ async function handleTelegramWebhook(request, env) {
     await handleGradesButton(env, chatId);
     return new Response('OK');
   }
+  if (text === BTN_GPA || /^\/gpa\b/i.test(text)) {
+    await handleGpaButton(env, chatId);
+    return new Response('OK');
+  }
+  if (/^\/pause\b/i.test(text)) {
+    await handlePauseCommand(env, chatId);
+    return new Response('OK');
+  }
+  if (/^\/resume\b/i.test(text)) {
+    await handleResumeCommand(env, chatId);
+    return new Response('OK');
+  }
 
   // Any other message: ignore.
   return new Response('OK');
+}
+
+async function handlePauseCommand(env, chatId) {
+  const token = await env.TOKENS.get(`chat:${chatId}`);
+  if (!token) {
+    await sendTelegram(env, chatId,
+      'עוד לא חיברת את הבוט.\nשלח/י /start כדי להתחיל.');
+    return;
+  }
+  await env.TOKENS.put(`paused:${token}`, '1');
+  // A paused user must never get "script stopped" warnings.
+  await env.TOKENS.delete(`warned:${token}`);
+  await sendTelegram(env, chatId,
+    '⏸️ הניטור הושהה.\nלא תישלחנה התראות ולא אזהרות "הסקריפט הפסיק".\n' +
+    'שלח/י /resume כדי לחדש.');
+}
+
+async function handleResumeCommand(env, chatId) {
+  const token = await env.TOKENS.get(`chat:${chatId}`);
+  if (!token) {
+    await sendTelegram(env, chatId,
+      'עוד לא חיברת את הבוט.\nשלח/י /start כדי להתחיל.');
+    return;
+  }
+  await env.TOKENS.delete(`paused:${token}`);
+  await sendTelegram(env, chatId,
+    '▶️ הניטור חודש! אחזור לעדכן אותך על כל שינוי בציונים.');
+}
+
+async function handleGpaButton(env, chatId) {
+  const token = await env.TOKENS.get(`chat:${chatId}`);
+  if (!token) {
+    await sendTelegram(env, chatId,
+      'עוד לא חיברת את הבוט.\nשלח/י /start כדי להתחיל.');
+    return;
+  }
+  const gpa = await env.TOKENS.get(`gpa:${token}`);
+  if (!gpa) {
+    await sendTelegram(env, chatId,
+      'אין עדיין ממוצע שמור מדף "ציונים ממוצעים" באינ-בר.\n' +
+      'הוא יתעדכן אוטומטית בריצה הבאה של המוניטור.');
+    return;
+  }
+  await sendTelegram(env, chatId, gpa);
+}
+
+// Fire the GitHub Actions workflow when the schedule lags. Needs three
+// Worker secrets/vars: GITHUB_PAT (fine-grained, actions:write),
+// GITHUB_REPO ("owner/repo"), GITHUB_WORKFLOW (file name, e.g. "inbar.yml").
+async function triggerGithubWorkflow(env) {
+  if (!env.GITHUB_PAT || !env.GITHUB_REPO || !env.GITHUB_WORKFLOW) return false;
+  try {
+    const r = await fetch(
+      `https://api.github.com/repos/${env.GITHUB_REPO}/actions/workflows/${env.GITHUB_WORKFLOW}/dispatches`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.GITHUB_PAT}`,
+          'Accept': 'application/vnd.github+json',
+          'User-Agent': 'inbar-relay-worker',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ ref: env.GITHUB_REF || 'main' })
+      });
+    return r.status === 204;
+  } catch {
+    return false;
+  }
 }
 
 async function handleConnectedButton(env, chatId) {
@@ -319,6 +436,8 @@ async function handleUnlink(request, env) {
   await env.TOKENS.delete(`heartbeat:${token}`);
   await env.TOKENS.delete(`grades:${token}`);
   await env.TOKENS.delete(`state:${token}`);
+  await env.TOKENS.delete(`gpa:${token}`);
+  await env.TOKENS.delete(`paused:${token}`);
 
   // Notify user + hide the persistent reply keyboard
   await sendTelegram(env, chatId,
@@ -566,7 +685,22 @@ async function handleGetState(url, env) {
   if (!TOKEN_RE.test(token)) return json({ error: 'bad token' }, 400);
   if (!(await env.TOKENS.get(token))) return json({ error: 'not linked' }, 404);
   const blob = await env.TOKENS.get(`state:${token}`);
-  return json({ state: blob || null });
+  const paused = !!(await env.TOKENS.get(`paused:${token}`));
+  return json({ state: blob || null, paused });
+}
+
+// Official GPA text pushed by the Python monitor after each successful run.
+async function handlePutGpa(request, env) {
+  let body;
+  try { body = await request.json(); }
+  catch { return json({ error: 'bad json' }, 400); }
+  const token = String(body.token || '').toLowerCase();
+  const gpa = String(body.gpa || '');
+  if (!TOKEN_RE.test(token)) return json({ error: 'bad token' }, 400);
+  if (!gpa || gpa.length > MAX_SUMMARY_LEN) return json({ error: 'bad gpa' }, 400);
+  if (!(await env.TOKENS.get(token))) return json({ error: 'not linked' }, 404);
+  await env.TOKENS.put(`gpa:${token}`, gpa, { expirationTtl: SUMMARY_TTL });
+  return json({ ok: true });
 }
 
 async function handlePutState(request, env) {

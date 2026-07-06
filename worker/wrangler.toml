@@ -14,7 +14,17 @@ id = "4c7fa02893ae464ea9ebde0d208dc319"
 # Secrets are NOT put in this file. Use:
 #   wrangler secret put BOT_TOKEN
 #   wrangler secret put WEBHOOK_SECRET
+#   wrangler secret put GITHUB_PAT        # fine-grained PAT, actions:write (cron backstop)
 
-# Hourly watchdog: DM users whose heartbeat is stale > 60 min.
+# Non-secret vars for the scheduling backstop (optional but recommended):
+[vars]
+GITHUB_REPO = "aloncohen/inbar-monitor"   # owner/repo of this project on GitHub
+GITHUB_WORKFLOW = "inbar.yml"             # workflow file to dispatch
+GITHUB_REF = "main"
+
+# Every 5 min: scheduling backstop — fires GitHub workflow_dispatch when a
+# user's heartbeat goes stale (GitHub's own cron is best-effort: it can lag
+# 5-30 min and silently auto-disables after repo inactivity). On the hour the
+# same tick also runs the stale-heartbeat watchdog (paused users are skipped).
 [triggers]
-crons = ["0 * * * *"]
+crons = ["*/5 * * * *"]

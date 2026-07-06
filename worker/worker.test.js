@@ -229,7 +229,8 @@ describe('POST /telegram-webhook (linking)', () => {
     const body = JSON.parse(tg.mock.calls[0][1].body);
     expect(body.reply_markup.keyboard).toEqual([
       [{ text: '🔌 האם אני מחובר?' }],
-      [{ text: '📊 רשימת הציונים' }]
+      [{ text: '📊 רשימת הציונים' }],
+      [{ text: '🎓 הממוצע שלי' }]
     ]);
     expect(body.reply_markup.is_persistent).toBe(true);
   });
@@ -470,7 +471,8 @@ describe('reply-keyboard button: "🔌 האם אני מחובר?"', () => {
     await env.TOKENS.put(`heartbeat:${VALID_TOKEN}`, String(Date.now() - 30 * 60_000));
     await fireButton(env, 7777, '🔌 האם אני מחובר?');
     const body = JSON.parse(tg.mock.calls[0][1].body);
-    expect(body.text).toMatch(/לא רץ ברגע זה/);
+    // 30 min is within the "GitHub Actions can lag" grace window (20-60 min)
+    expect(body.text).toMatch(/מתעכב/);
   });
 
   it('linked + heartbeat 3 days ago → "not seen for X days"', async () => {
