@@ -148,7 +148,10 @@ def _fetch_updates(offset: int) -> list:
     try:
         r = _tg_post("getUpdates", {"offset": offset, "timeout": 30})
         return r.get("result", []) if r.get("ok") else []
-    except requests.RequestException:
+    except requests.RequestException as e:
+        # A fast failure (e.g. DNS down) would otherwise busy-loop the caller.
+        print(f"[BOT] getUpdates failed ({e.__class__.__name__}) — retrying in 5 s")
+        _time.sleep(5)
         return []
 
 
@@ -587,12 +590,14 @@ async def _check_inbar_connection() -> tuple[bool, str]:
     async with async_playwright() as pw:
         try:
             browser, ctx, page = await _open_headless(pw)
+        except Exception as e:
+            print(f"[BOT] Connection check: browser launch failed: {e}")
+            return False, f"browser launch failed: {e}"
+        try:
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=25_000)
             await page.wait_for_timeout(1_500)
 
             if not is_on_grades_page(page.url) and not await _attempt_relogin(page, ctx):
-                await ctx.close()
-                await browser.close()
                 return False, "session פג וההתחברות האוטומטית נכשלה."
 
             from inbar.config import FILTER_DDL_SEL, GRADES_TABLE_SEL
@@ -601,19 +606,14 @@ async def _check_inbar_connection() -> tuple[bool, str]:
                 await page.select_option(FILTER_DDL_SEL, value="1")
                 await page.wait_for_load_state("networkidle", timeout=10_000)
                 await page.wait_for_selector(GRADES_TABLE_SEL, timeout=8_000)
-                table_found = True
             except PlaywrightTimeoutError:
-                table_found = False
-
-            await ctx.close()
-            await browser.close()
-
-            if table_found:
-                return True, "ok"
-            return False, "הדף נטען אך טבלת הציונים לא הופיעה."
-
+                return False, "הדף נטען אך טבלת הציונים לא הופיעה."
+            return True, "ok"
         except Exception as e:
             return False, str(e)
+        finally:
+            await ctx.close()
+            await browser.close()
 
 
 async def _fetch_gpa_live() -> str | None:
@@ -627,7 +627,11 @@ async def _fetch_gpa_live() -> str | None:
         return None
 
     async with async_playwright() as pw:
-        browser, ctx, page = await _open_headless(pw)
+        try:
+            browser, ctx, page = await _open_headless(pw)
+        except Exception as e:
+            print(f"[BOT] GPA fetch: browser launch failed: {e}")
+            return None
         try:
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=25_000)
             await page.wait_for_timeout(1_500)
@@ -712,8 +716,11 @@ async def run_bot() -> None:
     print("[BOT] Starting Telegram bot daemon...")
 
     # Delete any webhook — a set webhook silently blocks getUpdates
-    wh = _tg_post("deleteWebhook", {"drop_pending_updates": True})
-    print(f"[BOT] Webhook cleared: {wh.get('description', wh)}")
+    try:
+        wh = _tg_post("deleteWebhook", {"drop_pending_updates": True})
+        print(f"[BOT] Webhook cleared: {wh.get('description', wh)}")
+    except requests.RequestException as e:
+        print(f"[BOT] Webhook clear failed ({e}) — continuing; getUpdates may retry")
 
     startup_msg = (
         "בוט ציונים פעיל! 🟢\n"
@@ -727,7 +734,13 @@ async def run_bot() -> None:
     while True:
         updates = await asyncio.to_thread(_fetch_updates, _BOT_OFFSET["value"])
         for update in updates:
-            _BOT_OFFSET["value"] = await _handle_update(update)
+            # Never let one bad update kill the daemon — skip it and move on.
+            try:
+                _BOT_OFFSET["value"] = await _handle_update(update)
+            except Exception as e:
+                _BOT_OFFSET["value"] = update.get("update_id", 0) + 1
+                print(f"[BOT] Handler error for update "
+                      f"{update.get('update_id')}: {e!r} — update skipped")
 
 
 # ─── One-shot monitor (manual login/verification mode) ────────────────────────
