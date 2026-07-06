@@ -720,14 +720,20 @@ async def _handle_update(update: dict) -> int:
 
     register_user(sender_id)
 
-    # OTP handoff: the monitor daemon is waiting for an SMS code — relay it.
+    # OTP handoff: a digits-only message from the owner is an SMS code.
+    # Local daemon first (reply file); otherwise the cloud runner may be
+    # waiting — forward to the relay, which reports whether it was pending.
     import re
-    if (re.fullmatch(r"\d{4,8}", text) and sender_id == TELEGRAM_CHAT_ID
-            and _otp_request_pending()):
-        _OTP_REPLY_FILE.write_text(text)
-        print("[BOT] OTP code relayed to monitor daemon")
-        _send_with_keyboard("קיבלתי את הקוד ✅ מתחבר לאינ-בר...", chat_id=sender_id)
-        return update_id + 1
+    if re.fullmatch(r"\d{4,8}", text) and sender_id == TELEGRAM_CHAT_ID:
+        if _otp_request_pending():
+            _OTP_REPLY_FILE.write_text(text)
+            print("[BOT] OTP code relayed to monitor daemon")
+            _send_with_keyboard("קיבלתי את הקוד ✅ מתחבר לאינ-בר...", chat_id=sender_id)
+            return update_id + 1
+        if _forward_otp_to_relay(text):
+            print("[BOT] OTP code forwarded to cloud runner via relay")
+            _send_with_keyboard("קיבלתי את הקוד ✅ מתחבר לאינ-בר...", chat_id=sender_id)
+            return update_id + 1
 
     if BTN_GPA in text or "ממוצע" in text or text.lower().startswith("/gpa"):
         print("[BOT] Handler: GPA — live-scraping averages page")
@@ -778,13 +784,59 @@ async def _handle_update(update: dict) -> int:
 
 # ─── Bot daemon ───────────────────────────────────────────────────────────────
 
+def _forward_otp_to_relay(code: str) -> bool:
+    """Hand an SMS code to the Cloudflare relay for a waiting cloud runner.
+
+    Returns True only when the relay confirms an OTP request was pending —
+    otherwise the caller treats the digits as a normal message.
+    """
+    relay_url = os.environ.get("RELAY_URL", "").strip().rstrip("/")
+    token = os.environ.get("DAEMON_TOKEN", "").strip()
+    if not relay_url or not token:
+        return False
+    try:
+        r = requests.post(f"{relay_url}/otp-reply",
+                          json={"token": token, "code": code}, timeout=10)
+        return r.status_code == 200 and bool(r.json().get("pending"))
+    except (requests.RequestException, ValueError) as e:
+        print(f"[BOT] OTP forward to relay failed: {e}")
+        return False
+
+
+def _rearm_worker_webhook() -> None:
+    """Point Telegram back at the Cloudflare worker webhook.
+
+    Called when the bot shuts down (logout/shutdown): while this Mac is off,
+    the worker must receive messages directly or SMS codes go nowhere.
+    """
+    relay_url = os.environ.get("RELAY_URL", "").strip().rstrip("/")
+    if not relay_url:
+        return
+    try:
+        r = requests.post(f"{relay_url}/setup-webhook",
+                          json={"bot_token": TELEGRAM_BOT_TOKEN}, timeout=10)
+        print(f"[BOT] Worker webhook re-armed on shutdown (HTTP {r.status_code})")
+    except requests.RequestException as e:
+        print(f"[BOT] Webhook re-arm failed: {e}")
+
+
 async def run_bot() -> None:
     """Interactive Telegram bot daemon. Run with: python monitor.py --bot"""
+    import signal
+
     print("[BOT] Starting Telegram bot daemon...")
 
-    # Delete any webhook — a set webhook silently blocks getUpdates
+    # On logout/shutdown launchd sends SIGTERM — hand Telegram back to the
+    # cloud worker's webhook before dying so OTP replies still work PC-off.
+    def _on_sigterm(_sig, _frm):
+        _rearm_worker_webhook()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+    # Take over from the webhook — a set webhook silently blocks getUpdates.
+    # Never drop pending updates: they may hold an SMS code sent moments ago.
     try:
-        wh = _tg_post("deleteWebhook", {"drop_pending_updates": True})
+        wh = _tg_post("deleteWebhook", {"drop_pending_updates": False})
         print(f"[BOT] Webhook cleared: {wh.get('description', wh)}")
     except requests.RequestException as e:
         print(f"[BOT] Webhook clear failed ({e}) — continuing; getUpdates may retry")

@@ -162,6 +162,9 @@ export default {
     if (request.method === 'GET' && url.pathname === '/poll-otp') {
       return handlePollOtp(url, env);
     }
+    if (request.method === 'POST' && url.pathname === '/otp-reply') {
+      return handleOtpReply(request, env);
+    }
     if (request.method === 'GET' && url.pathname === '/state') {
       return handleGetState(url, env);
     }
@@ -659,9 +662,31 @@ async function handleRequestOtp(request, env) {
   if (!chatId) return json({ error: 'not linked' }, 404);
   await env.TOKENS.put(`otp:pending:${chatId}`, '1', { expirationTtl: OTP_TTL });
   await sendTelegram(env, chatId,
-    '🔒 אינ-בר דורש הזדהות מחדש.\n' +
-    'פתח/י אינ-בר בדפדפן, התחבר/י עם ת.ז. + טלפון — ושלח/י לי את קוד ה-SMS שקיבלת:');
+    '🔐 נדרש קוד אימות כדי להתחבר לאינ-בר.\n' +
+    'נשלח אליך SMS לטלפון — שלח/י לי כאן את הקוד (ספרות בלבד):');
   return json({ ok: true });
+}
+
+// The local Telegram bot owns getUpdates while the user's Mac is on, so the
+// webhook never sees the reply. The bot forwards the digits here instead.
+// Returns pending:false when no OTP request is waiting (bot then treats the
+// message as a normal command).
+async function handleOtpReply(request, env) {
+  let body;
+  try { body = await request.json(); }
+  catch { return json({ error: 'bad json' }, 400); }
+  const token = String(body.token || '').toLowerCase();
+  const code = String(body.code || '');
+  if (!TOKEN_RE.test(token)) return json({ error: 'bad token' }, 400);
+  if (!/^\d{4,8}$/.test(code)) return json({ error: 'bad code' }, 400);
+  const chatId = await env.TOKENS.get(token);
+  if (!chatId) return json({ error: 'not linked' }, 404);
+  const pending = !!(await env.TOKENS.get(`otp:pending:${chatId}`));
+  if (pending) {
+    await env.TOKENS.delete(`otp:pending:${chatId}`);
+    await env.TOKENS.put(`otp:code:${chatId}`, code, { expirationTtl: OTP_TTL });
+  }
+  return json({ ok: true, pending });
 }
 
 async function handlePollOtp(url, env) {

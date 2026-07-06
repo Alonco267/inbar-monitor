@@ -571,3 +571,55 @@ describe('privacy — KV never stores anything besides token↔chat_id', () => {
     expect([...env.TOKENS._store.entries()]).toEqual([...before.entries()]);
   });
 });
+
+describe('POST /otp-reply (local bot forwards SMS code to a waiting cloud runner)', () => {
+  const post = (env, body) => worker.fetch(new Request(`${URL_BASE}/otp-reply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }), env);
+
+  it('stores the code and clears pending when a request is waiting', async () => {
+    const env = ENV();
+    await env.TOKENS.put(VALID_TOKEN, '42');
+    await env.TOKENS.put('otp:pending:42', '1');
+
+    const r = await post(env, { token: VALID_TOKEN, code: '627322' });
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ ok: true, pending: true });
+    expect(env.TOKENS._store.get('otp:code:42')).toBe('627322');
+    expect(env.TOKENS._store.has('otp:pending:42')).toBe(false);
+  });
+
+  it('reports pending:false and stores nothing when no request is waiting', async () => {
+    const env = ENV();
+    await env.TOKENS.put(VALID_TOKEN, '42');
+
+    const r = await post(env, { token: VALID_TOKEN, code: '627322' });
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ ok: true, pending: false });
+    expect(env.TOKENS._store.has('otp:code:42')).toBe(false);
+  });
+
+  it('rejects a bad token, a non-numeric code, and an unlinked token', async () => {
+    const env = ENV();
+    expect((await post(env, { token: 'zzz', code: '1234' })).status).toBe(400);
+    expect((await post(env, { token: VALID_TOKEN, code: 'abcd' })).status).toBe(400);
+    expect((await post(env, { token: VALID_TOKEN, code: '1234' })).status).toBe(404);
+  });
+
+  it('poll-otp then returns and consumes the forwarded code', async () => {
+    const env = ENV();
+    await env.TOKENS.put(VALID_TOKEN, '42');
+    await env.TOKENS.put('otp:pending:42', '1');
+    await post(env, { token: VALID_TOKEN, code: '627322' });
+
+    const r = await worker.fetch(
+      new Request(`${URL_BASE}/poll-otp?token=${VALID_TOKEN}`), ENV_ROUTE(env));
+    expect(await r.json()).toEqual({ code: '627322' });
+    expect(env.TOKENS._store.has('otp:code:42')).toBe(false);
+  });
+});
+
+// poll-otp needs the same env object (shared KV), tiny alias for readability
+function ENV_ROUTE(env) { return env; }
