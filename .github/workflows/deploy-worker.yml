@@ -11,11 +11,15 @@ on:
 jobs:
   test-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the GitHub Release + tag below
     defaults:
       run:
         working-directory: worker
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so --generate-notes can diff against the last tag
 
       - uses: actions/setup-node@v4
         with:
@@ -34,3 +38,14 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           workingDirectory: worker
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push'   # skip on manual re-run without a new commit
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="worker-$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+          gh release create "$TAG" \
+            --title "Worker deploy $(date +%Y-%m-%d)" \
+            --generate-notes
