@@ -18,7 +18,7 @@ id = "4c7fa02893ae464ea9ebde0d208dc319"
 
 # Non-secret vars for the scheduling backstop (optional but recommended):
 [vars]
-GITHUB_REPO = "aloncohen/inbar-monitor"   # owner/repo of this project on GitHub
+GITHUB_REPO = "Alonco267/inbar-monitor"   # owner/repo of this project on GitHub
 GITHUB_WORKFLOW = "inbar.yml"             # workflow file to dispatch
 GITHUB_REF = "main"
 

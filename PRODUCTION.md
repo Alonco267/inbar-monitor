@@ -34,9 +34,28 @@ local daemon/bot modes and the manual-login bootstrap.
 - **Official GPA**: the "🎓 הממוצע שלי" button (or `/gpa`) returns the
   averages scraped from Inbar's Average-Grades page each run.
 - **Scheduling backstop**: the Worker cron (`*/5`) fires
-  `workflow_dispatch` via the GitHub API when the heartbeat is >4 min stale
+  `workflow_dispatch` via the GitHub API when the heartbeat is >12 min stale
+  and it's inside the same 05:00-20:00 UTC daytime window as the GitHub cron
   (needs `GITHUB_PAT` secret + `GITHUB_REPO`/`GITHUB_WORKFLOW` vars) —
-  covers GitHub cron lag and silent auto-disable.
+  covers GitHub cron lag and silent auto-disable, without double-triggering
+  a healthy schedule or firing overnight.
+
+### Deploying the Worker (GitHub Actions, no local `wrangler login` needed)
+
+[.github/workflows/deploy-worker.yml](.github/workflows/deploy-worker.yml)
+runs the Worker's test suite and deploys it on every push to `main` that
+touches `worker/**` (or via manual "Run workflow"). One-time setup:
+
+1. Create a Cloudflare API token: dashboard → My Profile → API Tokens →
+   "Edit Cloudflare Workers" template (scoped to this account).
+2. In the GitHub repo: Settings → Secrets and variables → Actions →
+   New repository secret → `CLOUDFLARE_API_TOKEN` → paste the token.
+3. Push to `main` (or run the workflow manually) — it deploys automatically.
+
+The `GITHUB_PAT` secret (for the scheduling backstop) and the `BOT_TOKEN` /
+`WEBHOOK_SECRET` Worker secrets are separate — set those with
+`wrangler secret put <NAME>` once, from any machine with `wrangler login`
+access; they persist across GitHub-driven deploys and don't need to be reset.
 
 ---
 
