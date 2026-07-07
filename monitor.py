@@ -52,6 +52,7 @@ BASE_DIR        = Path(__file__).parent
 STORAGE_FILE    = BASE_DIR / "session_cookies.json"
 USER_DATA_DIR   = BASE_DIR / "inbar_profile"          # persistent Chromium profile
 DATA_FILE       = BASE_DIR / "data.json"
+EVER_ALERTED_FILE = BASE_DIR / ".ever_alerted.json"   # persistent dedup set
 USERS_FILE      = BASE_DIR / "users.json"
 DEBUG_HTML_FILE = _scrape.DEBUG_HTML_FILE
 
@@ -175,6 +176,26 @@ def save_current(data: dict) -> None:
     )
     _lock(DATA_FILE)
     print(f"[DATA] {len(data)} row(s) saved → {DATA_FILE.name}")
+
+
+def load_ever_alerted() -> dict:
+    """Persistent set of dedup ids already delivered — survives reboots.
+
+    Maps ``dedup_id → 1``. Guarantees exactly-once alerting even when the
+    previous grade snapshot is lost or comes back partial after a reconnect.
+    """
+    if EVER_ALERTED_FILE.exists():
+        try:
+            return json.loads(EVER_ALERTED_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            print("[DEDUP] ever-alerted file unreadable — starting fresh")
+    return {}
+
+
+def save_ever_alerted(ids: dict) -> None:
+    EVER_ALERTED_FILE.write_text(
+        json.dumps(ids, ensure_ascii=False), encoding="utf-8")
+    _lock(EVER_ALERTED_FILE)
 
 
 # ─── User registry ────────────────────────────────────────────────────────────
@@ -522,8 +543,10 @@ async def run_daemon() -> None:
     next_ping  = 0.0
     login_failures = 0
     warned_expired = _EXPIRED_FLAG.exists()   # survive restarts — don't re-spam
-    baseline_saved = False
-    notified_running = False                  # send "monitoring" only after first success
+    ever_alerted = load_ever_alerted()        # persistent dedup — survives reboot
+    # "monitoring" greeting and baseline happen only on the genuine first run;
+    # once we have a dedup set on disk, a restart is silent (no re-flood).
+    notified_running = bool(ever_alerted)
 
     while True:
         try:
@@ -604,15 +627,32 @@ async def run_daemon() -> None:
                         next_check = _time.monotonic() + 300
                         continue
 
-                    if not baseline_saved:
-                        print("[DAEMON] Startup baseline saved — monitoring from next check.")
-                        baseline_saved = True
+                    old = load_saved()
+                    # Genuine first run only: seed the dedup set from what's
+                    # already on the page so existing grades never alert, even
+                    # if data.json is later lost. Mirrors monitor_once.py.
+                    if not old and not ever_alerted:
+                        print("[DAEMON] First run — seeding dedup baseline (silent).")
+                        ever_alerted = _diff.baseline_dedup_ids(fresh)
+                        save_ever_alerted(ever_alerted)
                         if not notified_running:
                             _notify("🟢 מנטר ציונים ברקע\nאעדכן אותך אוטומטית על כל שינוי בציונים.")
                             notified_running = True
                     else:
-                        old = load_saved()
-                        diff_and_alert(old, fresh, sender=_notify)
+                        alerts = _diff.compute_alerts(old, fresh)
+                        to_send, ever_alerted = _diff.filter_alerts(alerts, ever_alerted)
+                        for alert in to_send:
+                            _notify(alert.message)
+                            print(f"[ALERT] {alert.kind} — {alert.key}")
+                        # Keep the dedup set a superset of everything currently
+                        # visible, so a later data.json loss / partial scrape can
+                        # never make already-seen grades look new and re-flood.
+                        ever_alerted = {**_diff.baseline_dedup_ids(fresh),
+                                        **ever_alerted}
+                        save_ever_alerted(ever_alerted)
+                        print(f"[DIFF] {len(to_send)} new alert(s) sent."
+                              if to_send else
+                              "[DIFF] No new changes (already-seen items suppressed).")
 
                     save_current(fresh)
                     await ctx.storage_state(path=str(STORAGE_FILE))

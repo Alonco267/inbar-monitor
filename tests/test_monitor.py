@@ -508,3 +508,39 @@ class TestSemester:
 
     def test_bad_date(self):
         assert monitor._semester("")[1] == "?"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Persistent dedup set (anti-flood on reconnect / reboot)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_ever_alerted_roundtrip_and_lock(tmp_path):
+    """save_ever_alerted persists JSON and locks the file to owner-only."""
+    target = tmp_path / ".ever_alerted.json"
+    with patch.object(monitor, "EVER_ALERTED_FILE", target):
+        monitor.save_ever_alerted({"מתמטיקה|א|01/06|grade|95": 1})
+        assert monitor.load_ever_alerted() == {"מתמטיקה|א|01/06|grade|95": 1}
+        assert (target.stat().st_mode & 0o777) == 0o600
+
+
+def test_load_ever_alerted_missing_and_corrupt(tmp_path):
+    target = tmp_path / ".ever_alerted.json"
+    with patch.object(monitor, "EVER_ALERTED_FILE", target):
+        assert monitor.load_ever_alerted() == {}          # missing → empty
+        target.write_text("{not json", encoding="utf-8")
+        assert monitor.load_ever_alerted() == {}          # corrupt → empty, no raise
+
+
+def test_reconnect_with_lost_snapshot_does_not_reflood():
+    """The core guarantee: a full scrape after data.json loss re-sends nothing."""
+    from inbar import diff as _diff
+    grades = {
+        "מתמטיקה|א|01/06/2027": _make_info(course_name="מתמטיקה", grade="95", final_grade="95"),
+        "פיזיקה|ב|10/06/2027": _make_info(course_name="פיזיקה", grade="88", final_grade="88"),
+    }
+    ever = _diff.baseline_dedup_ids(grades)
+    # old={} simulates a lost/partial snapshot; every grade looks "new"
+    raw = _diff.compute_alerts({}, grades)
+    to_send, _ = _diff.filter_alerts(raw, ever)
+    assert raw, "sanity: raw diff wants to alert"
+    assert to_send == [], "already-seen grades must be suppressed after reconnect"

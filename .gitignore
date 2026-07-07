@@ -17,6 +17,9 @@ logs/
 
 # Runtime flags & test caches
 .session_expired_notified
+.ever_alerted.json
+.otp_request
+.otp_reply
 .pytest_cache/
 
 # Python
