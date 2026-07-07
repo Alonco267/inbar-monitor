@@ -56,13 +56,8 @@ EVER_ALERTED_FILE = BASE_DIR / ".ever_alerted.json"   # persistent dedup set
 USERS_FILE      = BASE_DIR / "users.json"
 DEBUG_HTML_FILE = _scrape.DEBUG_HTML_FILE
 
-# ─── Daemon smart-polling constants ───────────────────────────────────────────
-_FAST_SECS      = 10 * 60
-_SLOW_SECS      = 30 * 60
-_KEEPALIVE_SECS = 12 * 60        # max gap even when nothing pending
-_DAY_START      = 8
-_DAY_END        = 23
-_CRIT_DAYS      = 6   # critical window starts 6 days after exam
+# ─── Daemon polling constants ─────────────────────────────────────────────────
+_REFRESH_SECS   = 5 * 60         # flat full-scrape cadence while the Mac is on
 
 # ─── Bot keyboard button labels ───────────────────────────────────────────────
 BTN_GRADES     = "📊 רשימת הציונים הסופיים שלי"
@@ -431,31 +426,13 @@ def _pending_courses(grades: dict) -> dict:
     return result
 
 
-def _in_critical_window(grades: dict) -> bool:
-    """True if any pending course's exam was 6+ days ago (grade not yet posted)."""
-    today = datetime.date.today()
-    for info in _pending_courses(grades).values():
-        parsed = parse_date(info.get("date", ""))
-        if not parsed:
-            continue
-        d, m, y = parsed
-        try:
-            days_since = (today - datetime.date(y, m, d)).days
-        except ValueError:
-            continue
-        if days_since >= _CRIT_DAYS:
-            return True
-    return False
-
-
 def _poll_secs(grades: dict) -> int:
-    """Smart polling interval matching the userscript logic."""
-    if not _pending_courses(grades):
-        return _KEEPALIVE_SECS
-    hour = datetime.datetime.now().hour
-    if _DAY_START <= hour < _DAY_END and _in_critical_window(grades):
-        return _FAST_SECS
-    return _SLOW_SECS
+    """Flat 5-minute full refresh while the Mac is on (exam-season cadence).
+
+    The persistent dedup set makes frequent scrapes safe — already-seen grades
+    are suppressed, so a tight interval only means faster new-grade delivery.
+    """
+    return _REFRESH_SECS
 
 
 async def _handle_login(page, username: str, password: str,
