@@ -21,6 +21,10 @@ class RelayClient:
     def __init__(self, relay_url: str, token: str):
         self.relay_url = relay_url.rstrip("/")
         self.token = token
+        # Set by load_state(): True when the browser userscript reported a
+        # recent heartbeat, meaning the daily Chrome session is live and the
+        # CI runner can skip its scrape (and avoid triggering MFA).
+        self.browser_active = False
 
     # ── low level ─────────────────────────────────────────────────────────
     def _post(self, path: str, body: dict) -> requests.Response | None:
@@ -76,6 +80,7 @@ class RelayClient:
             return {}, False
         payload = r.json()
         paused = bool(payload.get("paused"))
+        self.browser_active = bool(payload.get("browserActive"))
         blob = payload.get("state")
         if not blob:
             return {}, paused

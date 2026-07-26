@@ -213,6 +213,14 @@ async def run_once() -> int:
         log.info("monitoring is PAUSED (user request) — skipping run")
         return 0
 
+    if getattr(relay, "browser_active", False):
+        # The daily Chrome + userscript session is live and already scraping.
+        # Skip: a CI scrape here would only risk triggering MFA/OTP on a
+        # session that's being kept logged in by the browser anyway.
+        log.info("browser session is active — skipping CI scrape this run")
+        relay.heartbeat()
+        return 0
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if attempt > 1:
             wait = 20 * attempt

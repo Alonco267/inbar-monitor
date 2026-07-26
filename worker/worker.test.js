@@ -327,6 +327,29 @@ describe('POST /heartbeat', () => {
     expect(ts).toBeGreaterThanOrEqual(before);
   });
 
+  it('source:browser → also writes browser_hb:<token>', async () => {
+    const env = ENV();
+    await env.TOKENS.put(VALID_TOKEN, '111');
+    const r = await worker.fetch(new Request(`${URL_BASE}/heartbeat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: VALID_TOKEN, source: 'browser' })
+    }), env);
+    expect(r.status).toBe(200);
+    expect(env.TOKENS._store.has(`browser_hb:${VALID_TOKEN}`)).toBe(true);
+  });
+
+  it('no source (CI runner) → does NOT write browser_hb:<token>', async () => {
+    const env = ENV();
+    await env.TOKENS.put(VALID_TOKEN, '111');
+    await worker.fetch(new Request(`${URL_BASE}/heartbeat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: VALID_TOKEN })
+    }), env);
+    expect(env.TOKENS._store.has(`browser_hb:${VALID_TOKEN}`)).toBe(false);
+  });
+
   it('unlinked token → 404', async () => {
     const env = ENV();
     const r = await worker.fetch(new Request(`${URL_BASE}/heartbeat`, {
@@ -623,3 +646,56 @@ describe('POST /otp-reply (local bot forwards SMS code to a waiting cloud runner
 
 // poll-otp needs the same env object (shared KV), tiny alias for readability
 function ENV_ROUTE(env) { return env; }
+
+describe('POST /request-otp (pending-OTP guard — no SMS-prompt spam)', () => {
+  const post = (env) => worker.fetch(new Request(`${URL_BASE}/request-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: VALID_TOKEN })
+  }), env);
+
+  it('first request sets pending + sends the Telegram prompt', async () => {
+    const env = ENV();
+    await env.TOKENS.put(VALID_TOKEN, '42');
+    const spy = mockTelegramOK();
+
+    const r = await post(env);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ ok: true, alreadyPending: false });
+    expect(env.TOKENS._store.has('otp:pending:42')).toBe(true);
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+  });
+
+  it('second request while pending sends NO prompt (guard)', async () => {
+    const env = ENV();
+    await env.TOKENS.put(VALID_TOKEN, '42');
+    await env.TOKENS.put('otp:pending:42', '1');
+    const spy = mockTelegramOK();
+
+    const r = await post(env);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ ok: true, alreadyPending: true });
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+});
+
+describe('GET /state exposes browserActive', () => {
+  it('true when a browser heartbeat is fresh', async () => {
+    const env = ENV();
+    await env.TOKENS.put(VALID_TOKEN, '42');
+    await env.TOKENS.put(`browser_hb:${VALID_TOKEN}`, String(Date.now()));
+    const r = await worker.fetch(
+      new Request(`${URL_BASE}/state?token=${VALID_TOKEN}`), env);
+    expect((await r.json()).browserActive).toBe(true);
+  });
+
+  it('false when no browser heartbeat present', async () => {
+    const env = ENV();
+    await env.TOKENS.put(VALID_TOKEN, '42');
+    const r = await worker.fetch(
+      new Request(`${URL_BASE}/state?token=${VALID_TOKEN}`), env);
+    expect((await r.json()).browserActive).toBe(false);
+  });
+});

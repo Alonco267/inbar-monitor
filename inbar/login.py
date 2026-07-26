@@ -27,6 +27,13 @@ class LoginFailed(Exception):
 
 GRADES_URL_MARKER = "StudentAssignmentTermList"
 
+# OTP wait budget. The CI job (see .github/workflows/inbar.yml) is capped at
+# 8 minutes; page navigation + scrape eats ~2 of them, so a single OTP wait
+# must stay well under 6. 60 polls × 4s ≈ 4 min leaves comfortable margin.
+OTP_POLL_INTERVAL_S = 4
+OTP_POLL_ATTEMPTS = 60
+OTP_WAIT_MINUTES = (OTP_POLL_INTERVAL_S * OTP_POLL_ATTEMPTS) // 60
+
 
 async def ensure_grades_page(page) -> bool:
     """After a successful sign-in we may land on Main.aspx or the portal —
@@ -121,7 +128,8 @@ async def _handle_ms_mfa(page, otp_provider) -> None:
                     "set TELEGRAM_BOT_TOKEN (bot asks in chat) or DAEMON_TOKEN (relay)")
         return
 
-    log.info("MFA: SMS sent — waiting for code from OTP provider (up to 5 min)")
+    log.info("MFA: SMS sent — waiting for code from OTP provider (up to %d min)",
+             OTP_WAIT_MINUTES)
     code = await otp_provider()
     if not code:
         log.warning("MFA: no code received — cannot finish sign-in")
@@ -262,7 +270,7 @@ async def otp_login_via_telegram(page, otp_provider) -> bool:
                 log.warning("could not dump OTP page: %s", e)
             return False
 
-        log.info("waiting for OTP code (up to 5 min)...")
+        log.info("waiting for OTP code (up to %d min)...", OTP_WAIT_MINUTES)
         otp_code = await otp_provider()
         if not otp_code:
             log.warning("timeout waiting for OTP")
@@ -322,11 +330,25 @@ async def portal_login(page, username: str, password: str,
 
 
 def _relay_otp_provider(relay: RelayClient):
-    """Adapt the Cloudflare-relay OTP flow to the async otp_provider protocol."""
+    """Adapt the Cloudflare-relay OTP flow to the async otp_provider protocol.
+
+    Single-shot per run: the first call sends one SMS and polls for the reply;
+    any later call in the same run returns None immediately. Waiting twice (the
+    MS-MFA path AND the Inbar OTP-form path both ask) would exceed the 8-minute
+    CI job budget — the job gets killed mid-wait — and re-send the SMS. If the
+    user didn't answer the first prompt, a second identical wait is pointless.
+    """
+    used = False
+
     async def _provider() -> str | None:
+        nonlocal used
+        if used:
+            log.info("OTP already attempted this run — skipping a second wait")
+            return None
+        used = True
         relay.request_otp()
-        for _ in range(75):
-            await asyncio.sleep(4)
+        for _ in range(OTP_POLL_ATTEMPTS):
+            await asyncio.sleep(OTP_POLL_INTERVAL_S)
             code = relay.poll_otp()
             if code:
                 return code

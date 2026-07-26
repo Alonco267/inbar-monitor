@@ -31,6 +31,10 @@ const TOKEN_RE = /^[a-f0-9]{32,64}$/;
 const HEARTBEAT_TTL = 60 * 60 * 24 * 90;   // 90 days
 const SUMMARY_TTL = HEARTBEAT_TTL;
 const OTP_TTL = 10 * 60;                    // OTP pending/code expires in 10 min
+// "Browser is live" marker set by the Tampermonkey userscript's heartbeat.
+// While fresh, the CI runner skips its own scrape so it never triggers MFA —
+// the daily Chrome session already keeps things logged in and monitored.
+const BROWSER_HB_TTL = 12 * 60;             // 12 min (~2 userscript cycles)
 const STATE_TTL = HEARTBEAT_TTL;            // daemon state (cookies + last grades) — 90d
 const MAX_STATE_BYTES = 512 * 1024;         // 512KB — Playwright storage_state is typically <50KB
 
@@ -418,6 +422,12 @@ async function handleHeartbeat(request, env) {
   if (!(await env.TOKENS.get(token))) return json({ error: 'not linked' }, 404);
   await env.TOKENS.put(`heartbeat:${token}`, String(Date.now()),
     { expirationTtl: HEARTBEAT_TTL });
+  // A heartbeat from the browser userscript marks the daily Chrome session as
+  // live (short TTL). The CI runner reads this to back off and avoid MFA.
+  if (String(body.source || '') === 'browser') {
+    await env.TOKENS.put(`browser_hb:${token}`, String(Date.now()),
+      { expirationTtl: BROWSER_HB_TTL });
+  }
   // The script is alive again — clear any pending "you've gone silent" warning
   // so a future outage can trigger a fresh alert.
   await env.TOKENS.delete(`warned:${token}`);
@@ -660,11 +670,18 @@ async function handleRequestOtp(request, env) {
   if (!TOKEN_RE.test(token)) return json({ error: 'bad token' }, 400);
   const chatId = await env.TOKENS.get(token);
   if (!chatId) return json({ error: 'not linked' }, 404);
+  // Pending-OTP guard: every 5-min cron tick would otherwise re-send this
+  // Telegram prompt while the user is still being asked for the same code.
+  // If a request is already pending (within OTP_TTL), stay silent — the runner
+  // keeps polling for the reply and the user sees exactly one prompt.
+  if (await env.TOKENS.get(`otp:pending:${chatId}`)) {
+    return json({ ok: true, alreadyPending: true });
+  }
   await env.TOKENS.put(`otp:pending:${chatId}`, '1', { expirationTtl: OTP_TTL });
   await sendTelegram(env, chatId,
     '🔐 נדרש קוד אימות כדי להתחבר לאינ-בר.\n' +
     'נשלח אליך SMS לטלפון — שלח/י לי כאן את הקוד (ספרות בלבד):');
-  return json({ ok: true });
+  return json({ ok: true, alreadyPending: false });
 }
 
 // The local Telegram bot owns getUpdates while the user's Mac is on, so the
@@ -711,7 +728,8 @@ async function handleGetState(url, env) {
   if (!(await env.TOKENS.get(token))) return json({ error: 'not linked' }, 404);
   const blob = await env.TOKENS.get(`state:${token}`);
   const paused = !!(await env.TOKENS.get(`paused:${token}`));
-  return json({ state: blob || null, paused });
+  const browserActive = !!(await env.TOKENS.get(`browser_hb:${token}`));
+  return json({ state: blob || null, paused, browserActive });
 }
 
 // Official GPA text pushed by the Python monitor after each successful run.

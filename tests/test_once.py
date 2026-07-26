@@ -10,14 +10,19 @@ import monitor_once as mo
 
 
 class FakeRelay:
-    def __init__(self, paused=False, state=None):
+    def __init__(self, paused=False, state=None, browser_active=False):
         self._paused = paused
         self._state = state or {}
+        self.browser_active = browser_active
         self.alerts: list[str] = []
         self.saved_states: list[dict] = []
+        self.heartbeats = 0
 
     def load_state(self):
         return self._state, self._paused
+
+    def heartbeat(self):
+        self.heartbeats += 1
 
     def save_state(self, state):
         self.saved_states.append(state)
@@ -96,3 +101,21 @@ def test_paused_run_skips_scrape_and_exits_zero(monkeypatch):
         rc = asyncio.run(mo.run_once())
     assert rc == 0
     scrape.assert_not_called()
+
+
+def test_active_browser_skips_scrape_and_exits_zero(monkeypatch):
+    """While the daily Chrome userscript is live, the CI runner must not scrape
+    (avoids triggering MFA on a session the browser keeps logged in)."""
+    monkeypatch.setenv("RELAY_URL", "https://relay.test")
+    monkeypatch.setenv("DAEMON_TOKEN", "a" * 48)
+    monkeypatch.setenv("INBAR_USERNAME", "user")
+    monkeypatch.setenv("INBAR_PASSWORD", "pass")
+
+    fake = FakeRelay(browser_active=True)
+    scrape = MagicMock(side_effect=AssertionError("must not scrape while browser active"))
+    with patch.object(mo, "RelayClient", return_value=fake), \
+         patch.object(mo, "_scrape_attempt", scrape):
+        rc = asyncio.run(mo.run_once())
+    assert rc == 0
+    scrape.assert_not_called()
+    assert fake.heartbeats == 1  # still reports liveness

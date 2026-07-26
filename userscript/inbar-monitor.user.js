@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Inbar Grade Monitor (Bar-Ilan)
 // @namespace    https://github.com/aloncohen/inbar-monitor
-// @version      1.8.0
+// @version      1.8.2
 // @description  התראה ב-Telegram כשעולים ציונים באינ-בר. הציונים והסיסמה שלך נשארים בדפדפן בלבד.
 // @author       Alon Cohen
 // @match        https://inbar.biu.ac.il/*
@@ -35,13 +35,18 @@
 
   // ─── CRITICAL NETWORK ERROR GUARD ─────────────────────────────────────
   // If Chrome crashes or loses connection, it serves an internal offline page.
-  // Abort execution immediately to prevent unsafe cross-origin frame exceptions.
+  // Abort the normal run to avoid unsafe cross-origin frame exceptions — but
+  // schedule a self-healing reload so a transient network blip (Wi-Fi sleep,
+  // VPN drop, server hiccup) recovers on its own instead of leaving a dead
+  // tab that never refreshes until the user reloads it manually.
   if (window.location.href.startsWith('chrome-error://') || window.location.hostname === '') {
-    log('❌ Network Error: Internal browser offline page detected. Aborting run.');
+    const RETRY_MS = 60 * 1000;   // retry every minute until connectivity returns
+    log(`❌ Network Error: offline page detected. Auto-retrying in ${RETRY_MS / 1000}s.`);
+    setTimeout(() => location.reload(), RETRY_MS);
     return;
   }
 
-  log('script loaded v1.8.0 on', location.href);
+  log('script loaded v1.8.2 on', location.href);
 
   // ─── Configuration (set during build/deploy) ──────────────────────────
   const RELAY_URL = 'https://inbar-relay.alonco267.workers.dev';
@@ -530,7 +535,7 @@
 
   async function pushHeartbeatAndSummary(token, fresh) {
     try {
-      await relayPost('/heartbeat', { token });
+      await relayPost('/heartbeat', { token, source: 'browser' });
       const summary = buildFinalGradesMessage(fresh);
       await relayPost('/grades-summary', { token, summary });
     } catch (e) { log('heartbeat/summary push failed:', e); }
@@ -629,7 +634,7 @@
     }
 
     await ensureLinkConfirmation(token);
-    await relayPost('/heartbeat', { token });
+    await relayPost('/heartbeat', { token, source: 'browser' });
 
     if (isOnLoginPage()) {
       await maybeSendReloginAlert(token);
