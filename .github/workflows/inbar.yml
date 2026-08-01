@@ -28,26 +28,27 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      # Cache Playwright's Chromium binary across runs (~100MB).
-      # Cache key tied to requirements.txt so a Playwright version bump
-      # invalidates it automatically.
-      - name: Cache Playwright browsers
-        id: playwright-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-
       - name: Install Python deps (always runs, fast — pip cache hits)
         run: pip install -r requirements.txt
 
-      - name: Install Playwright browser (download only on cache miss)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: python -m playwright install --with-deps chromium
+      # requirements.txt pins playwright loosely (>=1.40.0), so the resolved
+      # version — and with it the Chromium build number — changes without the
+      # file changing. Key the cache on the resolved version, not the file.
+      - name: Resolve Playwright version
+        id: pw
+        run: echo "version=$(python -c 'from importlib.metadata import version; print(version("playwright"))')" >> "$GITHUB_OUTPUT"
 
-      - name: Install Playwright OS deps (system libs only, browser cached)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: python -m playwright install-deps chromium
+      # Cache Playwright's Chromium binary across runs (~100MB).
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      # Idempotent: a no-op download on a cache hit, and it still installs the
+      # OS libs, which live outside the cached path and never survive a run.
+      - name: Install Playwright browser
+        run: python -m playwright install --with-deps chromium
 
       - name: Run one-shot grade check
         env:
